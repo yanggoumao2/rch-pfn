@@ -1,0 +1,33 @@
+# Small architecture for CI and integration; same code paths as full configuration.
+model:
+  image_size: 32
+  patch_size: 8
+  vision_dim: 32
+  vision_layers: 1
+  vision_heads: 4
+  dim: 32
+  heads: 4
+  slots: 4
+  slot_iterations: 2
+  relation_layers: 1
+  core_layers: 2
+  graph_layers: 1
+  prediction_layers: 1
+  modes: 3
+  covariance_rank: 2
+  max_frames: 12
+  max_segments: 12
+  time_bins: 4
+  edge_chunk_size: 16
+train:
+  steps: 12
+  batch_size: 2
+  learning_rate: 0.001
+  eval_every: 6
+  save_every: 6
+prior:
+  systems: 12
+  episodes_per_system: 2
+  frames: 6
+  min_objects: 2
+  max_objects: 4

@@ -1,0 +1,33 @@
+# Bounded local engineering pilot; use held-out systems, no publication claim.
+model:
+  image_size: 64
+  patch_size: 8
+  vision_dim: 96
+  vision_layers: 2
+  vision_heads: 4
+  dim: 96
+  heads: 4
+  slots: 6
+  slot_iterations: 3
+  relation_layers: 2
+  core_layers: 3
+  graph_layers: 2
+  prediction_layers: 2
+  modes: 4
+  covariance_rank: 4
+  max_frames: 16
+  max_segments: 16
+  time_bins: 8
+  edge_chunk_size: 32
+train:
+  steps: 100
+  batch_size: 4
+  learning_rate: 0.0003
+  eval_every: 25
+  save_every: 25
+prior:
+  systems: 30
+  episodes_per_system: 3
+  frames: 8
+  min_objects: 2
+  max_objects: 5

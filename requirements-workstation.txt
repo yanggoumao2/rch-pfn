@@ -1,0 +1,25 @@
+# Exact workstation CPU verification environment; install project separately.
+--extra-index-url https://download.pytorch.org/whl/cpu
+build==1.6.1
+filelock==3.32.3
+fsspec==2026.7.0
+iniconfig==2.3.1
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+mpmath==1.3.0
+networkx==3.6.1
+numpy==2.5.4
+packaging==26.3
+pillow==12.3.0
+pluggy==1.7.0
+Pygments==2.21.0
+pyproject_hooks==1.3.3
+pytest==9.1.1
+PyYAML==6.0.3
+ruff==0.17.2
+scipy==1.18.1
+setuptools==78.1.0
+sympy==1.14.0
+torch==2.14.1+cpu
+typing_extensions==4.16.0
+wheel==0.48.0

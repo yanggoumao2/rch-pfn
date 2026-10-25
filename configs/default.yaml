@@ -1,0 +1,6 @@
+# Full v2 architecture. Numeric defaults are hypotheses, not validated optima.
+model: {}
+train: {}
+prior:
+  systems: 100
+  episodes_per_system: 4

@@ -1,0 +1,29 @@
+{
+  "completed_steps": 100,
+  "validation": {
+    "loss": -0.17631237705548605,
+    "state_nll": -0.5351873723169168,
+    "change_nll": 0.6961540992682179,
+    "prediction_nll": -2.3572994073232016,
+    "vision": 2.5617940028508506,
+    "geometry": 0.045560358402629696,
+    "round1": -2.1853187084198,
+    "state_dimensions": 252.0,
+    "change_labels": 124.0,
+    "prediction_dimensions": 1320.0,
+    "geometry_labels": 12.0,
+    "relation_attributes": 0.0,
+    "relation_attribute_labels": 0.0,
+    "examples": 12,
+    "elapsed_seconds": 0.5511254370212555,
+    "translation_coordinate_rmse_m": 0.036705450960905175,
+    "success_brier": 0.0006228117514789725,
+    "calibrated": false,
+    "physical_closed_loop_evaluation": false,
+    "aggregation": "scene-balanced; counts summed; one scene per predictive quadrature"
+  },
+  "elapsed_seconds": 32.13269837386906,
+  "device": "cpu",
+  "checkpoint_sha256": "05b5f20ee86c2676cedeff34e3a2e3061b43c952c70ab2b2c4ae9b512354a72a",
+  "purpose": "engineering verification unless a research protocol states otherwise"
+}

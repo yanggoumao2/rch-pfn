@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "Research software under development. Manuscript citation and author order have not been assigned."
+type: software
+title: "RCH-PFN: Relation-conditioned history inference from visual interaction contexts"
+version: 0.1.0
+abstract: >-
+  A configurable research implementation of visual relation contexts, shared
+  two-pass hypothesis-conditioned history inference, joint scene distributions,
+  action outcome prediction, and validated data/control interfaces.

@@ -1,0 +1,6 @@
+include README.md LICENSE CITATION.cff requirements-workstation.txt
+recursive-include configs *.yaml
+recursive-include docs *.md
+recursive-include scripts *.py *.sh
+recursive-include tests *.py
+recursive-exclude * __pycache__

@@ -1,0 +1,17 @@
+{
+  "environment": {
+    "python": "3.12.3",
+    "platform": "Linux-5.15.0-46-generic-x86_64-with-glibc2.31",
+    "hostname": "yxy-HP-Z8-G4-Workstation",
+    "torch": "2.14.1+cpu",
+    "numpy": "2.5.4",
+    "cuda_available": false,
+    "cuda_runtime": null
+  },
+  "dataset_manifest_sha256": "7e90432a626ee1a06ff20c3df4cf3f7c3d9776d78eaae4d72997b3a4a27d0263",
+  "source_sha256": "6c9cd976fe90432fd92f31bdbad5376c68ca2e0a936e8820ead2cc3e96a75602",
+  "parameters": 1470039,
+  "device": "cpu",
+  "resume": null,
+  "initialization": "random"
+}
