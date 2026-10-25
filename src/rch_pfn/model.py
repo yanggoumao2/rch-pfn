@@ -13,6 +13,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .config import ModelConfig
+from .recorder_encoder import RecorderEncoder
 from .schema import EvidenceBatch, JointBelief, ModelOutput
 
 
@@ -86,6 +87,29 @@ class VisualSlots(nn.Module):
 
     def forward(self, evidence: EvidenceBatch) -> dict[str, Tensor]:
         cfg, d = self.cfg, self.cfg.dim
+        b, t, c, _, h, w = evidence.images.shape
+        visual_valid = (
+            evidence.camera_valid
+            & evidence.frame_valid[..., None]
+            & evidence.pixel_valid.flatten(-2).any(-1)
+        )
+        if not visual_valid.any():
+            slots = self.initial[:, None].expand(b, t, -1, -1)
+            initial = slots.reshape(b * t, cfg.slots, d)
+            association = self.association_q(initial) @ self.association_k(initial).transpose(-1, -2)
+            association = torch.cat(
+                [association / math.sqrt(d), self.unmatched(initial)], -1
+            ).reshape(b, t, cfg.slots, cfg.slots + 1)
+            return {
+                "slots": slots,
+                "masks": evidence.images.new_zeros(
+                    b, t, cfg.slots + 1, c, (h // cfg.patch_size) ** 2
+                ),
+                "presence": self.presence(initial).squeeze(-1).reshape(b, t, cfg.slots),
+                "association": association,
+                "reconstruction": torch.zeros_like(evidence.images),
+                "background": self.background.expand(b, t, -1),
+            }
         patches, patch_valid = self.encode_images(
             evidence.images,
             evidence.pixel_valid,
@@ -367,6 +391,13 @@ class RCHPFN(nn.Module):
         self.conditioner = HistoryConditioner(cfg)
         self.hypothesis_state = mlp(12 + cfg.time_bins + 3, d, d * 2)
         self.predictor = ActionPredictor(cfg)
+        self.recorder = RecorderEncoder(cfg) if cfg.recorder_enabled else None
+        self.recorder_attention = (
+            nn.MultiheadAttention(d, cfg.heads, cfg.dropout, batch_first=True)
+            if cfg.recorder_enabled
+            else None
+        )
+        self.recorder_null = nn.Parameter(torch.zeros(1, 1, d)) if cfg.recorder_enabled else None
         n = cfg.slots + 2
         edge = torch.ones(n, n, dtype=torch.bool).fill_diagonal_(False).nonzero().T
         self.register_buffer("edge_index", edge, persistent=False)
@@ -415,6 +446,20 @@ class RCHPFN(nn.Module):
         visual = self.visual(evidence)
         anchors = self.anchor(evidence.anchor_poses.flatten(-2))
         nodes = torch.cat([visual["slots"], anchors], 2)
+        b, t = nodes.shape[:2]
+        if evidence.recorder is not None and self.recorder is not None:
+            recorder_summary, recorder_tokens, recorder_valid = self.recorder(evidence.recorder)
+        else:
+            if evidence.recorder is not None:
+                raise ValueError("recorder evidence requires model.recorder_enabled=true")
+            recorder_summary = nodes.new_zeros(nodes.shape[0], nodes.shape[1], nodes.shape[-1])
+            recorder_tokens = nodes.new_zeros(nodes.shape[0], nodes.shape[1], 1, nodes.shape[-1])
+            recorder_valid = torch.zeros(
+                nodes.shape[0], nodes.shape[1], 1, dtype=torch.bool, device=nodes.device
+            )
+        # Recorder state informs every node before relation construction. This keeps
+        # motion/contact evidence available even when RGB is absent or occluded.
+        nodes = nodes + recorder_summary[:, :, None, :]
         relative_times = evidence.timestamps - evidence.query_time[:, None]
         telemetry = torch.cat(
             [
@@ -447,6 +492,28 @@ class RCHPFN(nn.Module):
         )
         relation = relation + self.relation_quality(quality)
         relation = relation + robot[:, :, None] + task[:, None, None]
+        edges = edge.shape[1]
+        d = relation.shape[-1]
+        if self.recorder_attention is None or self.recorder_null is None:
+            recorder_read = relation.new_zeros(b, t, edges, d)
+        else:
+            recorder_tokens = torch.cat(
+                [recorder_tokens, self.recorder_null[:, :, None, :].expand(b, t, -1, -1)], -2
+            )
+            recorder_valid = torch.cat(
+                [recorder_valid, torch.ones(b, t, 1, dtype=torch.bool, device=nodes.device)], -1
+            )
+            relation_query = relation.reshape(b * t, edges, d)
+            recorder_memory = recorder_tokens.reshape(b * t, recorder_tokens.shape[2], d)
+            recorder_mask = ~recorder_valid.reshape(b * t, recorder_valid.shape[2])
+            recorder_read = self.recorder_attention(
+                relation_query,
+                recorder_memory,
+                recorder_memory,
+                key_padding_mask=recorder_mask,
+                need_weights=False,
+            )[0].reshape(b, t, edges, d)
+        relation = relation + recorder_read
         for block in self.relation_blocks:
             relation = relation + block(self.relation_norm(relation))
         context, actions, times, valid = self._pool_segments(relation, evidence)

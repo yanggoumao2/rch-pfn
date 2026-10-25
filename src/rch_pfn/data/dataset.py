@@ -13,10 +13,11 @@ import torch
 from torch import Tensor
 
 from ..config import Config, config_from_dict
-from ..schema import EvidenceBatch, TrainingTargets
+from ..schema import EvidenceBatch, RecorderEvidenceBatch, TrainingTargets
 from .format import (
     FORMAT_VERSION,
     OPTIONAL_TARGET_FIELDS,
+    RECORDER_FIELDS,
     SENSOR_FIELDS,
     SPLITS,
     TARGET_FIELDS,
@@ -25,13 +26,17 @@ from .format import (
     read_npz,
     safe_identifier,
     split_record_arrays,
+    split_recorder_arrays,
     validate_episode_arrays,
+    validate_recorder_arrays,
     write_npz,
 )
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
+LEGACY_MANIFEST_VERSIONS = (1,)
 SYNTHETIC_BACKEND = "procedural_rgb_kinematic"
 RECORDER_BACKEND = "recorder_npz_import"
+LABUTOPIA_BACKEND = "labutopia_recorder_v2"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -94,18 +99,29 @@ def validate_manifest(root: str | Path, config: Config | None = None) -> dict[st
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read dataset manifest at {manifest_path}: {exc}") from exc
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != MANIFEST_VERSION:
+    if not isinstance(manifest, dict) or manifest.get("schema_version") not in (
+        *LEGACY_MANIFEST_VERSIONS,
+        MANIFEST_VERSION,
+    ):
         raise ValueError("unsupported or malformed dataset manifest")
     backend = manifest.get("backend")
     if not isinstance(backend, str) or manifest.get("generator") != backend:
         raise ValueError("manifest generator/backend mismatch")
-    if backend not in (SYNTHETIC_BACKEND, RECORDER_BACKEND):
+    if backend not in (SYNTHETIC_BACKEND, RECORDER_BACKEND, LABUTOPIA_BACKEND):
         raise ValueError(f"unsupported dataset backend: {backend}")
+    if backend == LABUTOPIA_BACKEND and manifest["schema_version"] != MANIFEST_VERSION:
+        raise ValueError("LabUtopia datasets require manifest schema version 2")
     manifest_config = manifest.get("config")
     if not isinstance(manifest_config, dict):
         raise ValueError("manifest is missing its serialized config")
     effective_config = config if config is not None else config_from_dict(manifest_config)
     effective_config.validate()
+    if backend == LABUTOPIA_BACKEND:
+        manifest_policy = manifest_config.get("model", {}).get("recorder_policy")
+        if manifest_policy != effective_config.model.recorder_policy:
+            raise ValueError("LabUtopia manifest recorder policy differs from the requested model policy")
+        if not effective_config.model.recorder_enabled:
+            raise ValueError("LabUtopia datasets require model.recorder_enabled=true")
 
     groups = manifest.get("system_splits")
     if not isinstance(groups, dict) or set(groups) != set(SPLITS):
@@ -154,7 +170,9 @@ def validate_manifest(root: str | Path, config: Config | None = None) -> dict[st
         path = _record_path(root, item["path"])
         if file_sha256(path) != item["sha256"]:
             raise ValueError(f"episode hash mismatch: {item['path']}")
-        sensor, targets, meta = split_record_arrays(read_npz(path))
+        arrays = read_npz(path)
+        sensor, targets, meta = split_record_arrays(arrays)
+        recorder, _ = split_recorder_arrays(arrays)
         if (meta["system_id"], meta["episode_id"], meta["split"], meta["backend"]) != (
             system_id,
             episode_id,
@@ -162,7 +180,19 @@ def validate_manifest(root: str | Path, config: Config | None = None) -> dict[st
             backend,
         ):
             raise ValueError(f"record source identity mismatch: {item['path']}")
-        validate_episode_arrays(sensor, targets, effective_config)
+        validate_episode_arrays(sensor, targets, effective_config, recorder=recorder)
+        validate_recorder_arrays(recorder, effective_config)
+        if recorder and not effective_config.model.recorder_enabled:
+            raise ValueError("dataset contains recorder inputs but model.recorder_enabled is false")
+        if backend == LABUTOPIA_BACKEND:
+            if not recorder:
+                raise ValueError("LabUtopia episode is missing its structured recorder projection")
+            if manifest_policy == "deployable" and any(
+                np.asarray(recorder[name], dtype=bool).any()
+                for name in ("body_valid", "contact_valid", "contact_point_valid", "phase_valid", "trace_valid")
+                if name in recorder
+            ):
+                raise ValueError("deployable LabUtopia records cannot expose simulator-only fields")
 
     episode_systems = {item["system_id"] for item in episodes}
     if episode_systems != set(system_split):
@@ -176,7 +206,9 @@ def _numpy(value: Any) -> np.ndarray:
     return np.asarray(value)
 
 
-def _sensor_tensors(sensor: Mapping[str, np.ndarray]) -> EvidenceBatch:
+def _sensor_tensors(
+    sensor: Mapping[str, np.ndarray], recorder: Mapping[str, np.ndarray], config: Config
+) -> EvidenceBatch:
     bool_fields = {"pixel_valid", "frame_valid", "camera_valid", "result_valid", "metric_valid"}
     long_fields = {"segment_ids", "source_ids", "reference_version"}
     scalar_fields = {"query_time", "metric_valid", "reference_version"}
@@ -195,7 +227,30 @@ def _sensor_tensors(sensor: Mapping[str, np.ndarray]) -> EvidenceBatch:
         else:
             tensor = tensor.float()
         values[name] = tensor.unsqueeze(0) if name not in scalar_fields else tensor.reshape(1)
-    return EvidenceBatch(**values)
+    return EvidenceBatch(**values, recorder=_recorder_tensors(recorder, config))
+
+
+def _recorder_tensors(recorder: Mapping[str, np.ndarray], config: Config) -> RecorderEvidenceBatch | None:
+    if not recorder:
+        return None
+    bool_fields = {"body_valid", "joint_valid", "contact_valid", "contact_point_valid", "phase_valid", "sample_valid", "trace_valid"}
+    long_fields = {"phase_ids", "contact_count"}
+    values: dict[str, Tensor | None] = {}
+    for name, raw in recorder.items():
+        array = np.asarray(raw)
+        tensor = torch.from_numpy(np.array(array, copy=True))
+        if name in bool_fields:
+            tensor = tensor.bool()
+        elif name in long_fields:
+            tensor = tensor.long()
+        else:
+            tensor = tensor.float()
+        values[name] = tensor.unsqueeze(0)
+    for name in ("trace_times", "trace_body_positions", "trace_body_orientations_wxyz", "trace_valid"):
+        values.setdefault(name, None)
+    result = RecorderEvidenceBatch(**values)  # type: ignore[arg-type]
+    result.validate(config.model, 1, result.sample_time.shape[1])
+    return result
 
 
 def _target_tensors(targets: Mapping[str, np.ndarray]) -> TrainingTargets:
@@ -256,15 +311,20 @@ class EpisodeDataset(torch.utils.data.Dataset):
         path = _record_path(self.root, item["path"])
         if file_sha256(path) != item["sha256"]:
             raise ValueError(f"episode changed after manifest validation: {item['path']}")
-        sensor, targets, meta = split_record_arrays(read_npz(path))
+        arrays = read_npz(path)
+        sensor, targets, meta = split_record_arrays(arrays)
+        recorder, _ = split_recorder_arrays(arrays)
         if (meta["system_id"], meta["episode_id"], meta["split"]) != (
             item["system_id"],
             item["episode_id"],
             item["split"],
         ):
             raise ValueError("record identity changed after manifest validation")
-        validate_episode_arrays(sensor, targets, self.config)
-        evidence, supervision = _sensor_tensors(sensor), _target_tensors(targets)
+        validate_episode_arrays(sensor, targets, self.config, recorder=recorder)
+        validate_recorder_arrays(recorder, self.config)
+        if recorder and not self.config.model.recorder_enabled:
+            raise ValueError("dataset contains recorder inputs but model.recorder_enabled is false")
+        evidence, supervision = _sensor_tensors(sensor, recorder, self.config), _target_tensors(targets)
         evidence.validate(self.config.model)
         return evidence, supervision
 
@@ -310,6 +370,86 @@ def _pad_entity_pairs(values: Sequence[Tensor], max_n: int) -> Tensor:
     return output
 
 
+def _empty_recorder_like(
+    template: RecorderEvidenceBatch, max_t: int, max_h: int | None
+) -> RecorderEvidenceBatch:
+    """Create a fully masked recorder row for a legacy sample without recorder data."""
+    values: dict[str, Tensor | None] = {}
+    trace_names = {
+        "trace_times",
+        "trace_body_positions",
+        "trace_body_orientations_wxyz",
+        "trace_valid",
+    }
+    for field in fields(template):
+        name = field.name
+        value = getattr(template, name)
+        if value is None:
+            values[name] = None
+            continue
+        if name in trace_names:
+            if max_h is None:
+                values[name] = None
+                continue
+            shape = (1, max_h, *value.shape[2:])
+        else:
+            shape = (1, max_t, *value.shape[2:])
+        values[name] = torch.zeros(shape, dtype=value.dtype, device=value.device)
+    return RecorderEvidenceBatch(**values)  # type: ignore[arg-type]
+
+
+def _pad_recorder_rows(
+    rows: Sequence[RecorderEvidenceBatch | None], max_t: int
+) -> RecorderEvidenceBatch | None:
+    if not any(row is not None for row in rows):
+        return None
+    template = next(row for row in rows if row is not None)
+    assert template is not None
+    trace_names = {
+        "trace_times",
+        "trace_body_positions",
+        "trace_body_orientations_wxyz",
+        "trace_valid",
+    }
+    trace_present = any(row is not None and row.trace_times is not None for row in rows)
+    max_h = max(
+        (
+            row.trace_times.shape[1]
+            for row in rows
+            if row is not None and row.trace_times is not None
+        ),
+        default=0,
+    ) if trace_present else None
+    prepared = [
+        row if row is not None else _empty_recorder_like(template, max_t, max_h)
+        for row in rows
+    ]
+    output: dict[str, Tensor | None] = {}
+    for field in fields(template):
+        name = field.name
+        values = [getattr(row, name) for row in prepared]
+        if name in trace_names:
+            if not trace_present:
+                output[name] = None
+                continue
+            assert max_h is not None
+            first = next(value for value in values if value is not None)
+            padded = first.new_zeros((len(values), max_h, *first.shape[2:]))
+            for index, value in enumerate(values):
+                if value is not None:
+                    padded[index, : value.shape[1]] = value[0]
+            output[name] = padded
+            continue
+        first = values[0]
+        assert first is not None
+        padded = first.new_zeros((len(values), max_t, *first.shape[2:]))
+        for index, value in enumerate(values):
+            assert value is not None
+            padded[index, : value.shape[1]] = value[0]
+        output[name] = padded
+    return RecorderEvidenceBatch(**output)  # type: ignore[arg-type]
+
+
 def collate_episodes(
     samples: Sequence[tuple[EvidenceBatch, TrainingTargets]],
 ) -> tuple[EvidenceBatch, TrainingTargets]:
@@ -346,7 +486,10 @@ def collate_episodes(
     }
     for name in ("query_time", "task", "metric_valid", "reference_version"):
         evidence_values[name] = torch.cat([getattr(row, name) for row in evidence_rows], dim=0)
-    batched_evidence = EvidenceBatch(**evidence_values)
+    batched_evidence = EvidenceBatch(
+        **evidence_values,
+        recorder=_pad_recorder_rows([row.recorder for row in evidence_rows], max_t),
+    )
 
     target_time_entity = {"instance_masks", "visibility"}
     target_entity = {"poses", "pose_valid", "entity_valid"}
@@ -510,20 +653,35 @@ def export_recorder_npz(
     system_id: str,
     episode_id: str,
     split: str = "train",
+    archives: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Export one validated, unbatched sensor/target pair as the recorder NPZ contract."""
-    sensor_arrays = (
-        _unbatch_dataclass(sensor, SENSOR_FIELDS)
-        if is_dataclass(sensor)
-        else {name: _numpy(value) for name, value in sensor.items()}
-    )
+    recorder_arrays: dict[str, np.ndarray] | None = None
+    if is_dataclass(sensor):
+        sensor_arrays = _unbatch_dataclass(sensor, SENSOR_FIELDS)
+        nested = getattr(sensor, "recorder", None)
+        if nested is not None:
+            recorder_arrays = _unbatch_dataclass(nested, RECORDER_FIELDS)
+    else:
+        sensor_arrays = {
+            name: _numpy(value) for name, value in sensor.items() if name in SENSOR_FIELDS
+        }
+        nested = sensor.get("recorder")
+        if nested is not None:
+            recorder_arrays = (
+                _unbatch_dataclass(nested, RECORDER_FIELDS)
+                if is_dataclass(nested)
+                else {name: _numpy(value) for name, value in nested.items()}
+            )
     target_names = (*TARGET_FIELDS, *OPTIONAL_TARGET_FIELDS)
     target_arrays = (
         _unbatch_dataclass(targets, target_names)
         if is_dataclass(targets)
         else {name: _numpy(value) for name, value in targets.items()}
     )
-    validate_episode_arrays(sensor_arrays, target_arrays, config)
+    validate_episode_arrays(sensor_arrays, target_arrays, config, recorder=recorder_arrays)
+    if recorder_arrays:
+        validate_recorder_arrays(recorder_arrays, config)
     arrays = build_record_arrays(
         sensor_arrays,
         target_arrays,
@@ -531,6 +689,8 @@ def export_recorder_npz(
         episode_id=episode_id,
         split=split,
         backend="recorder_npz",
+        recorder=recorder_arrays,
+        archives=archives,
     )
     digest = write_npz(path, arrays)
     return {"format_version": FORMAT_VERSION, "sha256": digest, "bytes": Path(path).stat().st_size}
@@ -547,7 +707,9 @@ def import_recorder_npz(
 ) -> dict[str, Any]:
     """Import one exported/contract-compliant recording into a manifest-backed dataset."""
     source = Path(source)
-    source_sensor, source_targets, source_meta = split_record_arrays(read_npz(source))
+    source_arrays = read_npz(source)
+    source_sensor, source_targets, source_meta = split_record_arrays(source_arrays)
+    source_recorder, source_archives = split_recorder_arrays(source_arrays)
     if source_meta["backend"] != "recorder_npz":
         raise ValueError("input must use the recorder_npz export contract")
     resolved_system = system_id or source_meta["system_id"]
@@ -559,7 +721,9 @@ def import_recorder_npz(
         source_meta["split"],
     ):
         raise ValueError("import identity and split must match the NPZ source metadata")
-    validate_episode_arrays(source_sensor, source_targets, config)
+    validate_episode_arrays(source_sensor, source_targets, config, recorder=source_recorder)
+    if source_recorder:
+        validate_recorder_arrays(source_recorder, config)
 
     root = Path(output_root)
     manifest_path = root / "manifest.json"
@@ -599,6 +763,8 @@ def import_recorder_npz(
         episode_id=resolved_episode,
         split=resolved_split,
         backend=RECORDER_BACKEND,
+        recorder=source_recorder or None,
+        archives=source_archives or None,
     )
     digest = write_npz(destination, arrays)
     episodes.append(

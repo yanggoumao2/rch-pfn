@@ -13,7 +13,8 @@ import numpy as np
 
 from ..config import Config
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+LEGACY_FORMAT_VERSIONS = (1,)
 SENSOR_FIELDS = (
     "images",
     "pixel_valid",
@@ -50,6 +51,33 @@ TARGET_FIELDS = (
     "future_success",
     "future_success_valid",
 )
+RECORDER_FIELDS = (
+    "body_positions",
+    "body_orientations_wxyz",
+    "body_valid",
+    "joint_positions",
+    "joint_velocities",
+    "joint_targets",
+    "applied_targets",
+    "joint_valid",
+    "contact_force_base",
+    "contact_normal_force",
+    "contact_count",
+    "contact_valid",
+    "contact_points_base",
+    "contact_normals_base",
+    "contact_separations",
+    "contact_point_valid",
+    "phase_ids",
+    "phase_valid",
+    "sample_time",
+    "sample_valid",
+    "trace_times",
+    "trace_body_positions",
+    "trace_body_orientations_wxyz",
+    "trace_valid",
+)
+ARCHIVE_FIELDS = ("motion_json", "outcome_json", "field_manifest_json", "source_manifest_json")
 OPTIONAL_TARGET_FIELDS = (
     "equivalent_poses",
     "equivalent_valid",
@@ -142,6 +170,8 @@ def build_record_arrays(
     episode_id: str,
     split: str,
     backend: str,
+    recorder: Mapping[str, Any] | None = None,
+    archives: Mapping[str, Any] | None = None,
 ) -> dict[str, np.ndarray]:
     safe_identifier(system_id, "system_id")
     safe_identifier(episode_id, "episode_id")
@@ -165,6 +195,21 @@ def build_record_arrays(
             raise ValueError(f"{left} and {right} must be supplied together")
     arrays = {f"sensor__{name}": np.asarray(sensor[name]) for name in SENSOR_FIELDS}
     arrays.update({f"target__{name}": np.asarray(targets[name]) for name in targets})
+    if recorder is not None:
+        unknown = set(recorder) - set(RECORDER_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown recorder fields: {sorted(unknown)}")
+        arrays.update({f"recorder__{name}": np.asarray(recorder[name]) for name in recorder})
+    if archives is not None:
+        unknown = {
+            name
+            for name in archives
+            if name not in ARCHIVE_FIELDS
+            and not re.fullmatch(r"source_file_[0-9a-f]{64}", name)
+        }
+        if unknown:
+            raise ValueError(f"unknown archive fields: {sorted(unknown)}")
+        arrays.update({f"archive__{name}": np.asarray(archives[name]) for name in archives})
     arrays.update(
         {
             "meta__format_version": np.asarray(FORMAT_VERSION, dtype=np.int64),
@@ -203,8 +248,12 @@ def split_record_arrays(
         raise ValueError(f"invalid record metadata fields: {sorted(actual_meta)}")
     meta: dict[str, str] = {}
     version = np.asarray(arrays["meta__format_version"])
-    if version.shape != () or int(version) != FORMAT_VERSION:
+    if version.shape != () or int(version) not in (*LEGACY_FORMAT_VERSIONS, FORMAT_VERSION):
         raise ValueError(f"unsupported record format version: {version}")
+    if int(version) == 1 and any(
+        key.startswith(("recorder__", "archive__")) for key in arrays
+    ):
+        raise ValueError("record format version 1 cannot contain recorder or archive namespaces")
     for name in ("system_id", "episode_id", "split", "backend"):
         item = np.asarray(arrays[f"meta__{name}"])
         if item.shape != () or item.dtype.kind not in "US":
@@ -221,6 +270,8 @@ def split_record_arrays(
             sensor[key.removeprefix("sensor__")] = value
         elif key.startswith("target__"):
             targets[key.removeprefix("target__")] = value
+        elif key.startswith("recorder__") or key.startswith("archive__"):
+            continue
         elif not key.startswith("meta__"):
             raise ValueError(f"unrecognized NPZ namespace: {key}")
     if set(sensor) != set(SENSOR_FIELDS):
@@ -233,6 +284,127 @@ def split_record_arrays(
         if (left in targets) != (right in targets):
             raise ValueError(f"{left} and {right} must appear together")
     return sensor, targets, meta
+
+
+def split_recorder_arrays(
+    arrays: Mapping[str, np.ndarray],
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Return normalized recorder arrays and archived source JSON from a record."""
+    recorder: dict[str, np.ndarray] = {}
+    archives: dict[str, np.ndarray] = {}
+    for key, value in arrays.items():
+        if key.startswith("recorder__"):
+            recorder[key.removeprefix("recorder__")] = value
+        elif key.startswith("archive__"):
+            archives[key.removeprefix("archive__")] = value
+    unknown = set(recorder) - set(RECORDER_FIELDS)
+    if unknown:
+        raise ValueError(f"unrecognized recorder fields: {sorted(unknown)}")
+    unknown = {
+        name
+        for name in archives
+        if name not in ARCHIVE_FIELDS
+        and not re.fullmatch(r"source_file_[0-9a-f]{64}", name)
+    }
+    if unknown:
+        raise ValueError(f"unrecognized archive fields: {sorted(unknown)}")
+    return recorder, archives
+
+
+def validate_recorder_arrays(recorder: Mapping[str, np.ndarray], config: Config) -> None:
+    """Validate the normalized LabUtopia recorder view without inspecting raw archives."""
+    if not recorder:
+        return
+    m = config.model
+    required = set(RECORDER_FIELDS[:20])
+    if not required <= set(recorder):
+        raise ValueError(f"recorder namespace is incomplete: missing {sorted(required - set(recorder))}")
+    first = np.asarray(recorder["sample_time"])
+    if first.ndim != 1:
+        raise ValueError("recorder.sample_time must have shape [T]")
+    t = first.shape[0]
+    shapes = {
+        "body_positions": (t, m.recorder_body_count, 3),
+        "body_orientations_wxyz": (t, m.recorder_body_count, 4),
+        "body_valid": (t, m.recorder_body_count),
+        "joint_positions": (t, m.recorder_joint_count),
+        "joint_velocities": (t, m.recorder_joint_count),
+        "joint_targets": (t, m.recorder_joint_count),
+        "applied_targets": (t, m.recorder_joint_count),
+        "joint_valid": (t, m.recorder_joint_count),
+        "contact_force_base": (t, m.recorder_contact_pairs, 3),
+        "contact_normal_force": (t, m.recorder_contact_pairs),
+        "contact_count": (t, m.recorder_contact_pairs),
+        "contact_valid": (t, m.recorder_contact_pairs),
+        "contact_points_base": (t, m.recorder_contact_pairs, m.recorder_contact_points, 3),
+        "contact_normals_base": (t, m.recorder_contact_pairs, m.recorder_contact_points, 3),
+        "contact_separations": (t, m.recorder_contact_pairs, m.recorder_contact_points),
+        "contact_point_valid": (t, m.recorder_contact_pairs, m.recorder_contact_points),
+        "phase_ids": (t,),
+        "phase_valid": (t,),
+        "sample_time": (t,),
+        "sample_valid": (t,),
+    }
+    for name, expected in shapes.items():
+        _shape(f"recorder.{name}", np.asarray(recorder[name]), expected)
+    for name in ("body_valid", "joint_valid", "contact_valid", "contact_point_valid", "phase_valid", "sample_valid"):
+        if np.asarray(recorder[name]).dtype.kind != "b":
+            raise ValueError(f"recorder.{name} must be boolean")
+    for name in ("phase_ids", "contact_count"):
+        if np.asarray(recorder[name]).dtype.kind not in "iu":
+            raise ValueError(f"recorder.{name} must be integer-valued")
+    for name, value in recorder.items():
+        array = np.asarray(value)
+        if array.dtype.hasobject:
+            raise ValueError(f"recorder.{name} contains an object array")
+        if name not in {
+            "body_valid",
+            "joint_valid",
+            "contact_valid",
+            "contact_point_valid",
+            "phase_valid",
+            "sample_valid",
+            "trace_valid",
+            "phase_ids",
+            "contact_count",
+        } and array.dtype.kind not in "fiu":
+            raise ValueError(f"recorder.{name} must contain numeric values")
+        if array.dtype.kind == "f" and not np.isfinite(array).all():
+            raise ValueError(f"recorder.{name} contains nonfinite values")
+    contact_count = np.asarray(recorder["contact_count"], dtype=np.int64)
+    contact_valid = np.asarray(recorder["contact_valid"], dtype=bool)
+    point_valid = np.asarray(recorder["contact_point_valid"], dtype=bool)
+    if np.any(contact_count < 0) or np.any(contact_count > m.recorder_contact_points):
+        raise ValueError("recorder contact count exceeds the configured point capacity")
+    if np.any(point_valid & ~contact_valid[..., None]):
+        raise ValueError("contact points cannot be valid when their contact pair is missing")
+    measured_point_count = point_valid.sum(-1)
+    if np.any(contact_valid & (measured_point_count != contact_count)):
+        raise ValueError("valid contact point count disagrees with contact_count")
+    phase_ids = np.asarray(recorder["phase_ids"], dtype=np.int64)
+    if np.any((phase_ids < 0) | (phase_ids >= 64)):
+        raise ValueError("phase IDs must be in [0, 64)")
+    sample_time = np.asarray(recorder["sample_time"], dtype=np.float64)
+    sample_valid = np.asarray(recorder["sample_valid"], dtype=bool)
+    if np.any(np.diff(sample_time[sample_valid]) < 0):
+        raise ValueError("recorder samples must be chronological")
+    trace = {name for name in RECORDER_FIELDS[20:] if name in recorder}
+    if trace and trace != set(RECORDER_FIELDS[20:]):
+        raise ValueError("recorder trace fields must be supplied as a complete group")
+    if trace:
+        h = np.asarray(recorder["trace_times"]).shape[0]
+        if m.recorder_trace_frames and h > m.recorder_trace_frames:
+            raise ValueError("recorder trace exceeds configured capacity")
+        _shape("recorder.trace_times", np.asarray(recorder["trace_times"]), (h,))
+        _shape("recorder.trace_body_positions", np.asarray(recorder["trace_body_positions"]), (h, 2, 3))
+        _shape("recorder.trace_body_orientations_wxyz", np.asarray(recorder["trace_body_orientations_wxyz"]), (h, 2, 4))
+        _shape("recorder.trace_valid", np.asarray(recorder["trace_valid"]), (h,))
+        if np.asarray(recorder["trace_valid"]).dtype.kind != "b":
+            raise ValueError("recorder.trace_valid must be boolean")
+        trace_times = np.asarray(recorder["trace_times"], dtype=np.float64)
+        trace_valid = np.asarray(recorder["trace_valid"], dtype=bool)
+        if np.any(np.diff(trace_times[trace_valid]) < 0):
+            raise ValueError("recorder trace must be chronological")
 
 
 def _shape(name: str, array: np.ndarray, expected: tuple[int | None, ...]) -> None:
@@ -251,6 +423,7 @@ def validate_episode_arrays(
     sensor: Mapping[str, np.ndarray],
     targets: Mapping[str, np.ndarray],
     config: Config,
+    recorder: Mapping[str, np.ndarray] | None = None,
 ) -> None:
     """Validate shapes, units' numeric safety, causal timestamps, and supervision masks."""
     config.validate()
@@ -428,13 +601,34 @@ def validate_episode_arrays(
     frame_valid = np.asarray(sensor["frame_valid"], dtype=bool)
     camera_valid = np.asarray(sensor["camera_valid"], dtype=bool)
     pixel_valid = np.asarray(sensor["pixel_valid"], dtype=bool)
+    if recorder:
+        validate_recorder_arrays(recorder, config)
     if not frame_valid.any():
         raise ValueError("each episode requires at least one valid frame")
-    if not (camera_valid & pixel_valid.reshape(t, c, -1).any(-1))[frame_valid].any():
+    recorder_sample_valid = (
+        np.asarray(recorder["sample_valid"], dtype=bool).any() if recorder else False
+    )
+    if not (camera_valid & pixel_valid.reshape(t, c, -1).any(-1))[frame_valid].any() and not recorder_sample_valid:
         raise ValueError("each episode requires a valid visual observation")
+    if recorder and not recorder_sample_valid:
+        raise ValueError("recorder contains no valid sample")
     timestamps = np.asarray(sensor["timestamps"], dtype=np.float64)
     arrivals = np.asarray(sensor["arrival_times"], dtype=np.float64)
     query = float(np.asarray(sensor["query_time"]))
+    if recorder:
+        sample_time = np.asarray(recorder["sample_time"], dtype=np.float64)
+        sample_valid = np.asarray(recorder["sample_valid"], dtype=bool)
+        if sample_time.shape != (t,):
+            raise ValueError("recorder sample axis must match the evidence frame axis")
+        if not np.allclose(sample_time, timestamps, rtol=0, atol=1e-5):
+            raise ValueError("recorder samples must be aligned to evidence timestamps")
+        if np.any(sample_time[sample_valid] > query):
+            raise ValueError("future recorder sample in current-state evidence")
+        if "trace_times" in recorder:
+            trace_valid = np.asarray(recorder["trace_valid"], dtype=bool)
+            trace_times = np.asarray(recorder["trace_times"], dtype=np.float64)
+            if np.any(trace_times[trace_valid] > query):
+                raise ValueError("future recorder trace sample in current-state evidence")
     ids = np.asarray(sensor["source_ids"], dtype=np.int64)
     segments = np.asarray(sensor["segment_ids"], dtype=np.int64)
     valid_times, valid_arrivals = timestamps[frame_valid], arrivals[frame_valid]

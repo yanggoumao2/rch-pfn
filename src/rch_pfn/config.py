@@ -44,11 +44,24 @@ class ModelConfig:
     edge_chunk_size: int = 128
     rounds: int = 2
     condition_history: bool = True
+    recorder_body_count: int = 13
+    recorder_joint_count: int = 9
+    recorder_contact_pairs: int = 2
+    recorder_contact_points: int = 128
+    recorder_trace_frames: int = 256
+    recorder_enabled: bool = False
+    recorder_policy: str = "deployable"
+    recorder_force_scale: float = 10.0
+    recorder_velocity_scale: float = 2.0
 
     def validate(self) -> None:
         for f in fields(self):
             v = getattr(self, f.name)
-            if isinstance(v, int) and not isinstance(v, bool) and v < 1:
+            if (
+                isinstance(v, int)
+                and not isinstance(v, bool)
+                and v < 1
+            ):
                 raise ValueError(f"model.{f.name} must be positive")
         if self.dim % self.heads or self.vision_dim % self.vision_heads:
             raise ValueError("attention widths must be divisible by head counts")
@@ -56,11 +69,15 @@ class ModelConfig:
             raise ValueError("image_size must be divisible by patch_size")
         if self.rounds not in (1, 2):
             raise ValueError("rounds must be 1 or 2")
+        if self.recorder_policy not in {"deployable", "recorder_oracle"}:
+            raise ValueError("recorder_policy must be deployable or recorder_oracle")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0, 1)")
         for name in ("min_std", "translation_scale", "rotation_scale", "bias_bound"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.recorder_force_scale <= 0 or self.recorder_velocity_scale <= 0:
+            raise ValueError("recorder normalization scales must be positive")
 
 
 @dataclass

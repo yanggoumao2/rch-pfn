@@ -5,6 +5,7 @@ flowchart LR
   I[RGB + masks + calibration] --> V[Frame ViT and recurrent visual slots]
   V --> R[Directed relation evidence]
   A[Executed actions / robot state / observed outcomes] --> R
+  L[Normalized LabUtopia recorder channels] --> R
   R --> E[Segment context E]
   E --> P1[Shared context core: first read]
   P1 --> G1[Shared graph decoder: K joint hypotheses]
@@ -58,6 +59,36 @@ Current inputs are all causal observations; context attention may be bidirection
 inside that arrived prefix. The visual slot recurrence is chronological. Latest images
 already in context have one source ID and cannot be appended twice. Missing outcomes
 are zeroed and accompanied by masks; they are never imputed from a privileged target.
+
+## LabUtopia recorder path
+
+The LabUtopia importer preserves the native JSON source under `archive__*` fields and
+constructs a bounded `recorder__*` view. The recorder encoder turns body, joint,
+contact, phase, and optional trace channels into per-frame summary and token streams.
+The summary informs the relation nodes before context construction, and relation
+queries can attend to the recorder tokens. Raw archive bytes and the field manifest
+are provenance data; they are never read as model evidence.
+
+The projection keeps the first and last motion frames and every phase boundary within
+`model.max_frames`, then fills remaining slots deterministically. The optional 480 Hz
+pose trace is sampled to `model.recorder_trace_frames`. This keeps model tensors bounded
+while retaining the complete raw JSON archive for later reprojection.
+
+`deployable` masks simulator body transforms, contact geometry, high-rate trace, and
+scripted phase from recorder evidence while retaining measured joint state and command
+channels. Normalized oracle positions, contact points, normals, and forces use the
+initial robot-base frame; source JSON retains world-coordinate values. The
+`recorder_oracle` policy exposes those structured simulator channels for an explicit
+oracle or ablation run. Both policies keep the raw source and targets in the dataset;
+the target pose and success label do not enter `EvidenceBatch`.
+
+The current importer supplies no acquired RGB or camera calibration. It maps applied
+joint targets to the nine-value action field and measured joint positions/velocities to
+the 18-value robot field; observed outcomes and robot responses remain invalid or zero.
+It is a
+file adapter for recorder wiring and provenance retention. A live sensor or robot
+integration still needs to provide causal camera data, calibrated frames, action and
+response timing, identity supervision, and physical completion checks.
 
 ## Density and units
 

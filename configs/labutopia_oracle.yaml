@@ -1,0 +1,8 @@
+# LabUtopia recorder import with normalized simulator recorder channels available as oracle evidence.
+model:
+  action_dim: 9
+  robot_dim: 18
+  max_frames: 256
+  recorder_trace_frames: 256
+  recorder_enabled: true
+  recorder_policy: recorder_oracle

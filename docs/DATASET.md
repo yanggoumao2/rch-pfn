@@ -1,10 +1,11 @@
 # Dataset format and generation
 
 The data package offers a deterministic procedural RGB kinematic generator, a
-manifest-validated PyTorch dataset, variable-length collation, and a strict NPZ
-recorder interchange contract. The synthetic backend is a renderer with commanded
-object motion and simple hidden kinematic relations. It is not a contact-physics
-simulator and does not connect to LabUtopia or a physical recorder.
+manifest-validated PyTorch dataset, variable-length collation, a strict NPZ recorder
+interchange contract, and a file-based LabUtopia JSON importer. The synthetic backend
+is a renderer with commanded object motion and simple hidden kinematic relations. It
+does not provide live contact physics, simulator acquisition, or physical recorder
+connection.
 
 ```python
 from pathlib import Path
@@ -96,6 +97,74 @@ requested split, then checks each record against the supplied config. It returns
 `(EvidenceBatch, TrainingTargets)` with batch size one. `collate_episodes` pads time
 and object axes; padded evidence frames and targets are marked invalid. Training code
 should construct the dataset through `EpisodeDataset` so manifest validation runs.
+
+## LabUtopia JSON import
+
+`import_labutopia_episode` converts one native LabUtopia insertion recording into the
+`labutopia_recorder_v2` backend and validates the resulting manifest before returning.
+The input path must be `motion.json` or `partial-motion.json`; an adjacent
+`outcome.json` is used when present. The CLI uses the same API:
+
+```bash
+rch-pfn import-labutopia \
+  --motion recordings/run-001/motion.json \
+  --config configs/labutopia_deployable.yaml \
+  --output data/labutopia \
+  --system-id system-001 --episode-id episode-001 --split train
+```
+
+The Python entry point is:
+
+```python
+from rch_pfn.data import import_labutopia_episode
+
+summary = import_labutopia_episode(
+    "recordings/run-001/motion.json",
+    "data/labutopia",
+    config=config,
+    system_id="system-001",
+    episode_id="episode-001",
+    split="train",
+    policy="deployable",
+)
+```
+
+The importer provides complete raw archive retention for the native JSON episode. The
+output stores the byte-for-byte `motion.json`, optional `outcome.json`, and every other
+top-level `*.json` file beside the motion file under `archive__*` NPZ fields. The
+`archive__source_manifest_json` field records each source name, array key, byte count,
+and SHA-256; `archive__field_manifest_json` records the projection and policy. Raw
+source bytes remain available even when a field is excluded from model evidence. The
+archive scan covers JSON sidecars in the episode directory; non-JSON files and nested
+directories require separate preservation by the acquisition pipeline.
+
+The model projection is bounded by `model.max_frames` and
+`model.recorder_trace_frames`. Frame selection always keeps the first and last frame
+and every phase boundary, then fills the remaining capacity deterministically. A
+480 Hz actual-pose trace is sampled down to the trace budget. The selected recorder
+arrays are structured, shape-checked, and stored under `recorder__*`; the raw JSON
+archive is not truncated by either budget. The field manifest records raw and projected
+frame/trace counts and the selected frame indices.
+
+The two policies define which simulator-only channels are valid model evidence:
+
+| Policy | Recorder evidence | Purpose |
+|---|---|---|
+| `deployable` | Joint state, joint targets/applied targets, and sample timing remain valid. Body transforms, contacts, scripted phase, and the high-rate trace are masked invalid. | Train or inspect the path that excludes privileged simulator state. |
+| `recorder_oracle` | The normalized body, contact, and trace channels are also valid. | Explicit oracle or ablation experiments using simulator recorder state. |
+
+Both policies retain the raw archive. The final tube pose is a training target and is
+kept separate from `EvidenceBatch`; it is not supplied as current-state evidence. The
+oracle policy must not be interpreted as a deployable sensor configuration.
+
+Current importer limitations are explicit. It writes zero or invalid placeholders for
+RGB images, camera validity/calibration, observed outcomes, robot responses, instance
+masks, and future images because the native recorder input does not contain those
+streams. Applied joint targets populate the nine-dimensional action field, and measured
+joint positions plus velocities populate the 18-dimensional robot field. It expects the current 13-body, 9-joint, two-contact-pair
+layout and all body paths. A boolean success value is imported when available;
+non-boolean outcome values remain invalid. No live LabUtopia or robot connection and
+no physical completion or camera acquisition check is performed.
 
 ## Real recorder NPZ contract
 

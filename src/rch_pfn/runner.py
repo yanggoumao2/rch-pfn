@@ -79,16 +79,38 @@ def source_fingerprint() -> str:
 def load_checkpoint(path: str | Path, device="cpu") -> dict:
     # No arbitrary pickle globals accepted. Only use provenance-checked project weights.
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    if checkpoint.get("format_version") != 1:
+    if checkpoint.get("format_version") not in (1, 2):
         raise ValueError("unsupported checkpoint format")
     config_from_dict(checkpoint["config"])
     return checkpoint
 
 
+def load_model_state(model: torch.nn.Module, state: dict[str, torch.Tensor], checkpoint_version: int) -> None:
+    """Load legacy PFN weights while allowing the optional recorder modules to start fresh."""
+    if checkpoint_version == 1:
+        result = model.load_state_dict(state, strict=False)
+        allowed_missing = {
+            key for key in result.missing_keys
+            if key.startswith("recorder.")
+            or key.startswith("recorder_attention.")
+            or key == "recorder_null"
+        }
+        unexpected = set(result.unexpected_keys)
+        if unexpected or allowed_missing != set(result.missing_keys):
+            raise ValueError(
+                f"legacy checkpoint state mismatch: missing={result.missing_keys}, "
+                f"unexpected={result.unexpected_keys}"
+            )
+        return
+    model.load_state_dict(state, strict=True)
+
+
 def save_checkpoint(path: Path, model, teacher, optimizer, cfg, step, manifest_hash, best) -> None:
     numpy_rng = np.random.get_state()
     payload = {
-        "format_version": 1,
+        "format_version": 2,
+        "input_contract_version": 2,
+        "recorder_policy": cfg.model.recorder_policy,
         "config": cfg.to_dict(),
         "model": model.state_dict(),
         "teacher": teacher.state_dict(),
@@ -232,10 +254,10 @@ def _train_locked(cfg, data_root, run_dir, device, resume, init_from):
         raise ValueError("resume and initialization are distinct; specify only one")
     if init_from:
         checkpoint = load_checkpoint(init_from)
-        if checkpoint["config"]["model"] != cfg.to_dict()["model"]:
+        if config_from_dict(checkpoint["config"]).model != cfg.model:
             raise ValueError("native initialization requires an identical model configuration")
-        model.load_state_dict(checkpoint["model"], strict=True)
-        teacher.load_state_dict(checkpoint["teacher"], strict=True)
+        load_model_state(model, checkpoint["model"], checkpoint["format_version"])
+        load_model_state(teacher, checkpoint["teacher"], checkpoint["format_version"])
     if resume:
         checkpoint = load_checkpoint(resume)
         previous = config_from_dict(checkpoint["config"])
@@ -260,8 +282,8 @@ def _train_locked(cfg, data_root, run_dir, device, resume, init_from):
             raise ValueError("resume dataset changed")
         if checkpoint["source_sha256"] != source_fingerprint():
             raise ValueError("resume source changed; use --init-from for a new experiment")
-        model.load_state_dict(checkpoint["model"], strict=True)
-        teacher.load_state_dict(checkpoint["teacher"], strict=True)
+        load_model_state(model, checkpoint["model"], checkpoint["format_version"])
+        load_model_state(teacher, checkpoint["teacher"], checkpoint["format_version"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         first_step, best = checkpoint["step"], checkpoint["best_validation"]
         rng = checkpoint["rng"]
@@ -358,9 +380,9 @@ def evaluate(checkpoint_path: Path, data_root: Path, split: str, device_name: st
     torch.set_num_threads(min(cfg.train.cpu_threads, os.cpu_count() or 1))
     device = device_for(device_name)
     model = RCHPFN(cfg.model).to(device)
-    model.load_state_dict(checkpoint["model"], strict=True)
+    load_model_state(model, checkpoint["model"], checkpoint["format_version"])
     teacher = copy.deepcopy(model.visual).eval().requires_grad_(False)
-    teacher.load_state_dict(checkpoint["teacher"], strict=True)
+    load_model_state(teacher, checkpoint["teacher"], checkpoint["format_version"])
     dataset = EpisodeDataset(data_root, split, cfg)
     report = evaluate_model(model, teacher, dataset, cfg, device)
     report.update(

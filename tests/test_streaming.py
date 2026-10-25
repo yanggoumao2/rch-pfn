@@ -55,6 +55,7 @@ def test_padding_is_not_a_segment_and_rejected_append_is_transactional():
         "task",
         "metric_valid",
         "reference_version",
+        "recorder",
     }
     values = {
         name: torch.cat([getattr(item, name), torch.zeros_like(getattr(item, name))], 1)

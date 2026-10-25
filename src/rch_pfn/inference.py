@@ -10,7 +10,7 @@ from .config import ModelConfig
 from .geometry import pose_to_matrix, relative_transform
 from .losses import scales
 from .model import RCHPFN
-from .schema import EvidenceBatch, ModelOutput
+from .schema import EvidenceBatch, ModelOutput, RecorderEvidenceBatch
 
 
 @torch.no_grad()
@@ -82,6 +82,7 @@ class StreamingSession:
             "task",
             "metric_valid",
             "reference_version",
+            "recorder",
         }
         keep = observation.frame_valid[0].nonzero().flatten()
         if not keep.numel():
@@ -89,6 +90,7 @@ class StreamingSession:
         observation = replace(
             observation, **{name: getattr(observation, name)[:, keep] for name in temporal_names}
         )
+        observation = replace(observation, recorder=_slice_recorder(observation.recorder, keep))
         # Stable external segment IDs can exceed the model's local window capacity.
         original_segments = observation.segment_ids.clone()
         if (
@@ -121,6 +123,9 @@ class StreamingSession:
         values = {f.name: getattr(observation, f.name) for f in fields(EvidenceBatch)}
         for name in temporal_names:
             values[name] = torch.cat([getattr(previous, name), getattr(observation, name)], 1)
+        values["recorder"] = _concat_recorders(
+            previous.recorder, observation.recorder, self.model.cfg.recorder_trace_frames
+        )
         values["segment_ids"] = torch.cat([self._external_segments, original_segments], 1)
         # Enforce segment and frame budgets, preserving chronological source IDs.
         ids = values["segment_ids"][0]
@@ -129,6 +134,7 @@ class StreamingSession:
         keep = (ids >= cutoff).nonzero().flatten()[-self.model.cfg.max_frames :]
         for name in temporal_names:
             values[name] = values[name][:, keep]
+        values["recorder"] = _slice_recorder(values["recorder"], keep)
         retained_external_segments = values["segment_ids"].clone()
         _, remapped = values["segment_ids"].unique_consecutive(return_inverse=True)
         values["segment_ids"] = remapped
@@ -142,3 +148,108 @@ class StreamingSession:
         if self.evidence is None:
             raise ValueError("no observations")
         return self.model(self.evidence, future_actions)
+
+
+def _slice_recorder(
+    recorder: RecorderEvidenceBatch | None, keep: torch.Tensor
+) -> RecorderEvidenceBatch | None:
+    if recorder is None:
+        return None
+    temporal = {
+        "body_positions",
+        "body_orientations_wxyz",
+        "body_valid",
+        "joint_positions",
+        "joint_velocities",
+        "joint_targets",
+        "applied_targets",
+        "joint_valid",
+        "contact_force_base",
+        "contact_normal_force",
+        "contact_count",
+        "contact_valid",
+        "contact_points_base",
+        "contact_normals_base",
+        "contact_separations",
+        "contact_point_valid",
+        "phase_ids",
+        "phase_valid",
+        "sample_time",
+        "sample_valid",
+    }
+    return replace(recorder, **{name: getattr(recorder, name)[:, keep] for name in temporal})
+
+
+def _concat_recorders(
+    left: RecorderEvidenceBatch | None,
+    right: RecorderEvidenceBatch | None,
+    max_trace_frames: int,
+) -> RecorderEvidenceBatch | None:
+    temporal = {
+        "body_positions",
+        "body_orientations_wxyz",
+        "body_valid",
+        "joint_positions",
+        "joint_velocities",
+        "joint_targets",
+        "applied_targets",
+        "joint_valid",
+        "contact_force_base",
+        "contact_normal_force",
+        "contact_count",
+        "contact_valid",
+        "contact_points_base",
+        "contact_normals_base",
+        "contact_separations",
+        "contact_point_valid",
+        "phase_ids",
+        "phase_valid",
+        "sample_time",
+        "sample_valid",
+    }
+    trace_names = {
+        "trace_times",
+        "trace_body_positions",
+        "trace_body_orientations_wxyz",
+        "trace_valid",
+    }
+    if left is None and right is None:
+        return None
+    template = left if left is not None else right
+    assert template is not None
+    left_frames = left.sample_valid.shape[1] if left is not None else 0
+    right_frames = right.sample_valid.shape[1] if right is not None else 0
+    values: dict[str, torch.Tensor | None] = {}
+    for name in temporal:
+        sample = getattr(template, name)
+        assert sample is not None
+        left_value = getattr(left, name) if left is not None else sample.new_zeros((1, left_frames, *sample.shape[2:]))
+        right_value = getattr(right, name) if right is not None else sample.new_zeros((1, right_frames, *sample.shape[2:]))
+        values[name] = torch.cat([left_value, right_value], dim=1)
+
+    traced = [
+        row
+        for row in (left, right)
+        if row is not None and row.trace_times is not None and row.trace_valid is not None
+    ]
+    if traced:
+        trace_values = {
+            name: torch.cat([getattr(row, name) for row in traced], dim=1)
+            for name in trace_names
+        }
+        valid_indices = trace_values["trace_valid"][0].nonzero().flatten()
+        if valid_indices.numel():
+            times = trace_values["trace_times"][:, valid_indices]
+            order = torch.argsort(times[0], stable=True)
+            ordered = valid_indices[order]
+            ordered_times = trace_values["trace_times"][0, ordered]
+            keep = torch.ones_like(ordered_times, dtype=torch.bool)
+            keep[:-1] = ordered_times[:-1] != ordered_times[1:]
+            ordered = ordered[keep][-max_trace_frames:]
+            for name in trace_names:
+                values[name] = trace_values[name][:, ordered]
+        else:
+            values.update({name: None for name in trace_names})
+    else:
+        values.update({name: None for name in trace_names})
+    return RecorderEvidenceBatch(**values)

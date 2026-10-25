@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 
 from .config import config_from_dict, load_config
-from .data import EpisodeDataset, generate_dataset, validate_manifest
+from .data import EpisodeDataset, generate_dataset, import_labutopia_episode, validate_manifest
 from .inference import belief_to_dict
 from .model import RCHPFN
 from .runner import device_for, environment_report, evaluate, load_checkpoint, train, write_json
@@ -21,6 +21,14 @@ def parser() -> argparse.ArgumentParser:
     generate = commands.add_parser("generate", help="procedural kinematic RGB integration dataset")
     generate.add_argument("--config", type=Path, required=True)
     generate.add_argument("--output", type=Path, required=True)
+    labutopia = commands.add_parser("import-labutopia", help="import one LabUtopia recorder episode")
+    labutopia.add_argument("--motion", "--motion-path", dest="motion", type=Path, required=True)
+    labutopia.add_argument("--config", type=Path, required=True)
+    labutopia.add_argument("--output", type=Path, required=True)
+    labutopia.add_argument("--system-id")
+    labutopia.add_argument("--episode-id")
+    labutopia.add_argument("--split", choices=["train", "val", "test"], default="train")
+    labutopia.add_argument("--policy", choices=["deployable", "recorder_oracle"])
     validate = commands.add_parser("validate-data")
     validate.add_argument("--data", type=Path, required=True)
     training = commands.add_parser("train")
@@ -59,6 +67,17 @@ def main(argv=None) -> None:
             "episodes": len(manifest["episodes"]),
             "backend": manifest["backend"],
         }
+    elif args.command == "import-labutopia":
+        cfg = load_config(args.config)
+        payload = import_labutopia_episode(
+            args.motion,
+            args.output,
+            config=cfg,
+            system_id=args.system_id,
+            episode_id=args.episode_id,
+            split=args.split,
+            policy=args.policy or cfg.model.recorder_policy,
+        )
     elif args.command == "validate-data":
         manifest = validate_manifest(args.data)
         payload = {"valid": True, "episodes": len(manifest["episodes"])}

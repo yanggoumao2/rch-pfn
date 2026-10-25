@@ -24,6 +24,7 @@ build for the chosen device, then:
 ```bash
 python -m pip install -e '.[dev]'
 rch-pfn generate --config configs/smoke.yaml --output data/smoke
+rch-pfn import-labutopia --motion recordings/run-001/motion.json --config configs/labutopia_deployable.yaml --output data/labutopia --system-id system-001 --episode-id episode-001 --split train
 rch-pfn validate-data --data data/smoke
 rch-pfn train --config configs/smoke.yaml --data data/smoke --run runs/smoke --device cpu
 rch-pfn evaluate --checkpoint runs/smoke/best.pt --data data/smoke --split test --output runs/smoke/test.json
@@ -35,6 +36,23 @@ The generator renders procedural RGB kinematic scenes. It is an integration fixt
 **not contact physics or LabUtopia training data**. Real recordings use the validated
 NPZ import/export API documented in [DATASET.md](docs/DATASET.md). Model supervision
 is physically separated from its sensor-only input dataclass.
+
+The native LabUtopia importer accepts `motion.json` or `partial-motion.json` and stores
+the complete raw JSON archive inside each output NPZ, together with hashes and a field
+disposition manifest. It projects a bounded, validated recorder view for the model;
+phase boundaries are retained when the configured frame budget requires selection, and
+high-rate traces are reduced to the configured recorder trace budget. Use
+`configs/labutopia_deployable.yaml` for the deployable evidence policy or
+`configs/labutopia_oracle.yaml` for the explicit recorder-oracle policy. The command's
+`--policy` option overrides the policy in the selected config.
+
+The importer is currently a file adapter. It does not acquire live RGB, camera
+calibration, robot responses, or physical completion checks. Applied joint targets
+populate the nine-dimensional action field, and measured joint positions/velocities
+populate the 18-dimensional robot field; fields absent from the native recorder remain
+zero or invalid placeholders where the contract requires them. It also
+expects the current LabUtopia body and joint layout. The retained source archive keeps
+the original JSON available while a real acquisition adapter is developed.
 
 For a longer bounded development experiment, use `configs/pilot.yaml`. Full architecture
 defaults are in `configs/default.yaml` and `ModelConfig`; choose an explicit `cuda:N`
@@ -72,7 +90,7 @@ separate experiment needed for genuine upstream initialization.
 ## Repository map
 
 ```text
-configs/                  full, pilot and integration configurations
+configs/                  full, pilot, integration and LabUtopia recorder configurations
 src/rch_pfn/config.py      strict experiment schema
 src/rch_pfn/schema.py      evidence, targets and joint belief contracts
 src/rch_pfn/model.py       visual slots, shared core, conditioning and graph distributions
