@@ -77,7 +77,13 @@ RECORDER_FIELDS = (
     "trace_body_orientations_wxyz",
     "trace_valid",
 )
-ARCHIVE_FIELDS = ("motion_json", "outcome_json", "field_manifest_json", "source_manifest_json")
+ARCHIVE_FIELDS = (
+    "motion_json",
+    "outcome_json",
+    "field_manifest_json",
+    "source_manifest_json",
+    "rgb_record_manifest_json",
+)
 OPTIONAL_TARGET_FIELDS = (
     "equivalent_poses",
     "equivalent_valid",

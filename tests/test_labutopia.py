@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 import torch
@@ -92,6 +93,76 @@ def _episode_files(root: Path) -> tuple[Path, bytes, bytes]:
     (episode / "outcome.json").write_bytes(outcome_bytes)
     motion_path.write_bytes(motion_bytes)
     return motion_path, motion_bytes, outcome_bytes
+
+
+def _calibrated_rgb_file(
+    path: Path,
+    motion_path: Path,
+    motion_bytes: bytes,
+    outcome_bytes: bytes,
+    *,
+    offset_wrist_timestamp: float = 0.0,
+) -> Path:
+    motion = json.loads(motion_bytes)
+    outcome = json.loads(outcome_bytes)
+    outcome.update(success=True, task_success=True, strict_geometry_pass=True)
+    outcome_bytes = (json.dumps(outcome, separators=(",", ":")) + "\n").encode()
+    motion_path.with_name("outcome.json").write_bytes(outcome_bytes)
+    times = np.asarray([frame["time"] for frame in motion["frames"]], dtype=np.float64)
+    camera_names = ["third_person", "wrist"]
+    intrinsics = np.asarray(
+        [[[8.0, 0.0, 2.0], [0.0, 8.0, 2.0], [0.0, 0.0, 1.0]]] * 2,
+        dtype=np.float64,
+    )
+    extrinsics = np.repeat(np.eye(4, dtype=np.float64)[None, None], 2, axis=0)
+    extrinsics = np.repeat(extrinsics, len(times), axis=1)
+    extrinsics[1, :, 0, 3] = 0.2
+    rgb = np.zeros((len(times), 224, 224, 3), dtype=np.uint8)
+    rgb[:, :, :, 0] = np.arange(224, dtype=np.uint8)[None, None, :] + 16
+    rgb[:, :, :, 1] = np.arange(len(times), dtype=np.uint8)[:, None, None] * 16 + 32
+    with h5py.File(path, "w") as h5_file:
+        h5_file.attrs["schema"] = "labutopia-calibrated-rgb-v2"
+        h5_file.attrs["camera_names"] = json.dumps(camera_names)
+        h5_file.attrs["coordinate_convention"] = "camera_to_initial_robot_base, meters, USD camera axes"
+        h5_file.attrs["timestamp_convention"] = "measured Isaac Sim camera rendering_time_s; source motion time is stored separately"
+        h5_file.attrs["camera_timestamps_are_measured_rendering_time"] = True
+        h5_file.attrs["capture_mode"] = "isaacsim_pose_replay"
+        h5_file.attrs["source_motion_sha256"] = __import__("hashlib").sha256(motion_bytes).hexdigest()
+        h5_file.attrs["source_outcome_sha256"] = __import__("hashlib").sha256(outcome_bytes).hexdigest()
+        h5_file.attrs["success"] = True
+        h5_file.attrs["task_success"] = True
+        h5_file.attrs["strict_geometry_pass"] = True
+        h5_file.create_dataset("timestamps", data=times)
+        h5_file.create_dataset("source_timestamps", data=times)
+        camera_times = np.repeat(times[None, :], 2, axis=0)
+        camera_times[1, -1] += offset_wrist_timestamp
+        h5_file.create_dataset("camera_timestamps", data=camera_times)
+        h5_file.create_dataset(
+            "agent_pose",
+            data=np.asarray([frame["joint_positions"] for frame in motion["frames"]], dtype=np.float32),
+        )
+        h5_file.create_dataset(
+            "actions",
+            data=np.asarray([frame["applied_targets"] for frame in motion["frames"]], dtype=np.float32),
+        )
+        h5_file.create_dataset("source_frame_indices", data=np.arange(len(times), dtype=np.int64))
+        h5_file.create_dataset("camera_valid", data=np.ones((2, len(times)), dtype=bool))
+        h5_file.create_dataset("camera_intrinsics", data=intrinsics)
+        h5_file.create_dataset("camera_extrinsics", data=extrinsics)
+        h5_file.create_dataset("camera_distortion", data=np.zeros((2, 5), dtype=np.float64))
+        h5_file.create_dataset("render_sequence_numbers", data=np.tile(np.arange(len(times)) + 1, (2, 1)))
+        reference_numerators = np.rint(times * 100).astype(np.int64)
+        h5_file.create_dataset(
+            "render_frame_references",
+            data=np.stack(
+                [np.stack([reference_numerators, np.full_like(reference_numerators, 100)], axis=-1)] * 2
+            ),
+        )
+        for index, name in enumerate(camera_names):
+            image_data = rgb.copy()
+            image_data[:, :, :, 2] = (index + 1) * 32
+            h5_file.create_dataset(f"{name}_rgb", data=image_data)
+    return path
 
 
 def test_labutopia_import_preserves_all_source_json_and_projects_expected_channels(tmp_path):
@@ -214,6 +285,61 @@ def test_labutopia_import_supports_action_dimensions_larger_than_joint_count(tmp
     assert evidence.actions.shape == (1, 4, 16)
     torch.testing.assert_close(evidence.actions[0, :, :9], torch.full((4, 9), 0.15))
     assert torch.count_nonzero(evidence.actions[0, :, 9:]) == 0
+
+
+def test_calibrated_rgb_import_preserves_two_views_and_aligned_calibration(tmp_path):
+    motion_path, motion_bytes, outcome_bytes = _episode_files(tmp_path)
+    rgb_path = _calibrated_rgb_file(
+        tmp_path / "episode.h5", motion_path, motion_bytes, outcome_bytes
+    )
+    config = _config("deployable")
+    output = tmp_path / "dataset-rgb"
+    result = import_labutopia_episode(
+        motion_path,
+        output,
+        config=config,
+        system_id="system-rgb",
+        episode_id="episode-rgb",
+        calibrated_rgb_path=rgb_path,
+    )
+
+    arrays = read_npz(output / result["episode"])
+    assert arrays["sensor__images"].shape == (4, 2, 3, config.model.image_size, config.model.image_size)
+    assert arrays["sensor__camera_valid"].all()
+    assert arrays["sensor__pixel_valid"].all()
+    np.testing.assert_allclose(
+        arrays["sensor__calibration"][0, 0, :9],
+        [8, 0, 2, 0, 8, 2, 0, 0, 1],
+    )
+    np.testing.assert_allclose(arrays["sensor__calibration"][0, 1, 9 + 3], 0.2)
+    np.testing.assert_allclose(arrays["sensor__timestamps"], arrays["recorder__sample_time"])
+    archive_manifest = json.loads(str(arrays["archive__rgb_record_manifest_json"].item()))
+    assert archive_manifest["camera_names"] == ["third_person", "wrist"]
+    assert archive_manifest["selected_source_frame_indices"] == [0, 1, 2, 3]
+    assert result["camera_names"] == ["third_person", "wrist"]
+
+    evidence, _ = EpisodeDataset(output, "train", config)[0]
+    assert evidence.camera_valid.all()
+    assert evidence.calibration.shape == (1, 4, 2, 25)
+    assert not evidence.recorder.body_valid.any()
+
+
+def test_calibrated_rgb_import_rejects_timestamp_misalignment(tmp_path):
+    motion_path, motion_bytes, outcome_bytes = _episode_files(tmp_path)
+    rgb_path = _calibrated_rgb_file(
+        tmp_path / "misaligned.h5",
+        motion_path,
+        motion_bytes,
+        outcome_bytes,
+        offset_wrist_timestamp=1e-4,
+    )
+    with pytest.raises(ValueError, match="camera timestamps are not aligned"):
+        import_labutopia_episode(
+            motion_path,
+            tmp_path / "dataset-rgb",
+            config=_config("deployable"),
+            calibrated_rgb_path=rgb_path,
+        )
 
 
 def test_import_rejects_unregistered_phase_instead_of_hash_aliasing(tmp_path):

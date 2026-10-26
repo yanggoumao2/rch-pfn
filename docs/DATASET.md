@@ -113,6 +113,17 @@ rch-pfn import-labutopia \
   --system-id system-001 --episode-id episode-001 --split train
 ```
 
+To import the official LabUtopia RGB/calibration episode, add the HDF5 path. It must
+identify the same source JSON by SHA-256 and contain both `third_person` and `wrist`:
+
+```bash
+rch-pfn import-labutopia \
+  --motion recordings/run-001/motion.json \
+  --calibrated-rgb recordings/run-001/official-recorder/dataset/episode_0000.h5 \
+  --config configs/labutopia_deployable.yaml \
+  --output data/labutopia
+```
+
 The Python entry point is:
 
 ```python
@@ -126,6 +137,7 @@ summary = import_labutopia_episode(
     episode_id="episode-001",
     split="train",
     policy="deployable",
+    calibrated_rgb_path="recordings/run-001/official-recorder/dataset/episode_0000.h5",
 )
 ```
 
@@ -140,11 +152,28 @@ directories require separate preservation by the acquisition pipeline.
 
 The model projection is bounded by `model.max_frames` and
 `model.recorder_trace_frames`. Frame selection always keeps the first and last frame
-and every phase boundary, then fills the remaining capacity deterministically. A
-480 Hz actual-pose trace is sampled down to the trace budget. The selected recorder
-arrays are structured, shape-checked, and stored under `recorder__*`; the raw JSON
-archive is not truncated by either budget. The field manifest records raw and projected
-frame/trace counts and the selected frame indices.
+and every phase boundary, then fills the remaining capacity deterministically. With
+calibrated RGB, only source frames present in the HDF5 are candidates. A 480 Hz
+actual-pose trace is sampled down to the trace budget. The selected recorder arrays
+are structured, shape-checked, and stored under `recorder__*`; the raw JSON archive is
+not truncated by either budget. The field manifest records raw and projected
+frame/trace counts, camera names, HDF5 hash, and selected source frame indices.
+
+Calibrated RGB import fails closed when the HDF5 motion/outcome hashes, source-frame
+indices, timestamps, joint states, actions, camera validity, pinhole intrinsics, or
+camera-to-initial-base extrinsics do not match the JSON source. The HDF5 uses schema
+`labutopia-calibrated-rgb-v2`: each view stores the measured Isaac Sim
+`rendering_time`, plus the rational `rendering_frame` reference returned by the
+official camera API. Both views must share the measured timestamp and rational
+reference for each capture within the recorder tolerance. `timestamps` and
+`camera_timestamps` therefore represent the canonical measured camera clock;
+`source_timestamps` stores the original motion time for each `source_frame_indices`
+entry and is checked against the JSON source separately. The source-to-camera
+residual is reported in the manifest and is not required to be zero when the
+simulation render clock and pose-replay clock advance independently. Rational
+`render_frame` values are reference tokens, not seconds; their numerator must not
+be divided by their denominator to manufacture a time. The HDF5 explicitly labels
+the capture as `isaacsim_pose_replay`.
 
 The two policies define which simulator-only channels are valid model evidence:
 
@@ -157,14 +186,16 @@ Both policies retain the raw archive. The final tube pose is a training target a
 kept separate from `EvidenceBatch`; it is not supplied as current-state evidence. The
 oracle policy must not be interpreted as a deployable sensor configuration.
 
-Current importer limitations are explicit. It writes zero or invalid placeholders for
-RGB images, camera validity/calibration, observed outcomes, robot responses, instance
-masks, and future images because the native recorder input does not contain those
-streams. Applied joint targets populate the nine-dimensional action field, and measured
-joint positions plus velocities populate the 18-dimensional robot field. It expects the current 13-body, 9-joint, two-contact-pair
-layout and all body paths. A boolean success value is imported when available;
-non-boolean outcome values remain invalid. No live LabUtopia or robot connection and
-no physical completion or camera acquisition check is performed.
+Without a calibrated RGB HDF5, the importer retains its prior behavior and writes
+invalid visual placeholders. With HDF5, it imports two RGB streams and their intrinsic
+and per-frame extrinsic calibration; observed outcomes, robot responses, instance
+masks, and future images remain invalid because those target channels are not provided
+by this capture. The stored RGB is resized with nearest-neighbor sampling when the
+configured model image size differs from the recorder resolution. Applied joint
+targets populate the nine-dimensional action field, and measured joint positions plus
+velocities populate the 18-dimensional robot field. It expects the current 13-body,
+9-joint, two-contact-pair layout and all body paths. A boolean success value is
+imported when available; non-boolean outcome values remain invalid.
 
 ## Real recorder NPZ contract
 

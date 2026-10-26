@@ -29,6 +29,7 @@ def parser() -> argparse.ArgumentParser:
     labutopia.add_argument("--episode-id")
     labutopia.add_argument("--split", choices=["train", "val", "test"], default="train")
     labutopia.add_argument("--policy", choices=["deployable", "recorder_oracle"])
+    labutopia.add_argument("--calibrated-rgb", type=Path, help="official calibrated RGB episode HDF5")
     validate = commands.add_parser("validate-data")
     validate.add_argument("--data", type=Path, required=True)
     training = commands.add_parser("train")
@@ -77,6 +78,7 @@ def main(argv=None) -> None:
             episode_id=args.episode_id,
             split=args.split,
             policy=args.policy or cfg.model.recorder_policy,
+            calibrated_rgb_path=args.calibrated_rgb,
         )
     elif args.command == "validate-data":
         manifest = validate_manifest(args.data)

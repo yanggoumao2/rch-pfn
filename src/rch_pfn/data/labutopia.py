@@ -11,6 +11,11 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+try:
+    import h5py
+except ModuleNotFoundError:  # pragma: no cover - exercised only without calibrated RGB support
+    h5py = None  # type: ignore[assignment]
+
 from ..config import Config
 from .dataset import (
     LABUTOPIA_BACKEND,
@@ -143,7 +148,8 @@ def _rotation(quaternion_wxyz: np.ndarray) -> np.ndarray:
     if np.any(norm < 1e-8):
         raise ValueError("LabUtopia recorder contains a zero quaternion")
     xyzw = (quaternion / norm)[..., [1, 2, 3, 0]]
-    return Rotation.from_quat(xyzw).as_matrix()
+    flat_xyzw = xyzw.reshape(-1, 4)
+    return Rotation.from_quat(flat_xyzw).as_matrix().reshape(*xyzw.shape[:-1], 3, 3)
 
 
 def _phase_id(value: str) -> int:
@@ -172,31 +178,55 @@ def _body_indices(body_paths: list[str], expected_count: int) -> tuple[int, int,
     return 0, 9, 12
 
 
-def _select_frames(frames: list[dict[str, Any]], capacity: int) -> np.ndarray:
-    if len(frames) <= capacity:
-        return np.arange(len(frames), dtype=np.int64)
+def _select_frames(
+    frames: list[dict[str, Any]], capacity: int, available_indices: np.ndarray | None = None
+) -> np.ndarray:
+    available = (
+        np.arange(len(frames), dtype=np.int64)
+        if available_indices is None
+        else np.asarray(available_indices, dtype=np.int64)
+    )
+    if (
+        available.ndim != 1
+        or not len(available)
+        or np.any(available < 0)
+        or np.any(available >= len(frames))
+        or np.any(np.diff(available) <= 0)
+    ):
+        raise ValueError("available recorder frame indices must be unique and strictly increasing")
     phase_ids = [str(frame.get("phase", "")) for frame in frames]
-    mandatory = {0, len(frames) - 1}
-    mandatory.update(index for index in range(1, len(frames)) if phase_ids[index] != phase_ids[index - 1])
+    phase_boundaries = {
+        index for index in range(1, len(frames)) if phase_ids[index] != phase_ids[index - 1]
+    }
+    available_set = set(available.tolist())
+    if not phase_boundaries <= available_set:
+        raise ValueError("RGB recorder did not capture every source phase boundary")
+    if len(available) <= capacity:
+        return available.copy()
+    mandatory = {int(available[0]), int(available[-1])} | phase_boundaries
     if len(mandatory) > capacity:
         raise ValueError("configured max_frames cannot retain every recorder phase boundary")
     selected = set(mandatory)
     while len(selected) < capacity:
         ordered = sorted(selected)
-        candidates = range(len(frames))
         candidate = max(
-            (index for index in candidates if index not in selected),
+            (int(index) for index in available if int(index) not in selected),
             key=lambda index: min(abs(index - known) for known in ordered),
         )
         selected.add(candidate)
     return np.asarray(sorted(selected), dtype=np.int64)
 
 
-def _frame_recorder(motion: dict[str, Any], config: Config, policy: str) -> tuple[dict[str, np.ndarray], np.ndarray, list[str]]:
+def _frame_recorder(
+    motion: dict[str, Any],
+    config: Config,
+    policy: str,
+    available_indices: np.ndarray | None = None,
+) -> tuple[dict[str, np.ndarray], np.ndarray, list[str]]:
     frames = motion.get("frames")
     if not isinstance(frames, list) or not frames or not all(isinstance(row, dict) for row in frames):
         raise ValueError("motion.json must contain a nonempty frames array")
-    indices = _select_frames(frames, config.model.max_frames)
+    indices = _select_frames(frames, config.model.max_frames, available_indices)
     selected = [frames[int(index)] for index in indices]
     times = np.asarray([row["time"] for row in selected], dtype=np.float64)
     if not np.isfinite(times).all() or np.any(np.diff(times) < 0):
@@ -347,6 +377,199 @@ def _frame_recorder(motion: dict[str, Any], config: Config, policy: str) -> tupl
     return recorder, indices, body_paths
 
 
+def _decode_h5_text(value: Any) -> str:
+    return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+
+def _resize_rgb_frames(images: np.ndarray, size: int) -> np.ndarray:
+    """Resize recorder RGB frames without adding a PIL/torchvision dependency."""
+    frames = np.asarray(images, dtype=np.uint8)
+    if frames.ndim != 4 or frames.shape[-1] != 3:
+        raise ValueError(f"RGB recorder frames must have shape [T,H,W,3], got {frames.shape}")
+    if frames.shape[1:3] == (size, size):
+        return frames
+    row_indices = np.rint(np.linspace(0, frames.shape[1] - 1, size)).astype(np.int64)
+    col_indices = np.rint(np.linspace(0, frames.shape[2] - 1, size)).astype(np.int64)
+    return frames[:, row_indices][:, :, col_indices]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _load_calibrated_rgb(
+    path: str | Path,
+    motion_bytes: bytes,
+    outcome_bytes: bytes | None,
+    motion: dict[str, Any],
+    outcome: dict[str, Any],
+) -> dict[str, Any]:
+    if h5py is None:
+        raise RuntimeError("calibrated RGB import requires the optional h5py dependency")
+    path = Path(path).resolve()
+    if outcome_bytes is None:
+        raise ValueError("calibrated RGB import requires the source outcome.json")
+    with h5py.File(path, "r") as h5_file:
+        attrs = h5_file.attrs
+        if _decode_h5_text(attrs.get("schema", "")) != "labutopia-calibrated-rgb-v2":
+            raise ValueError("unsupported LabUtopia calibrated RGB schema")
+        if _decode_h5_text(attrs.get("capture_mode", "")) != "isaacsim_pose_replay":
+            raise ValueError("RGB record is not marked as an Isaac Sim pose replay")
+        expected_motion_hash = hashlib.sha256(motion_bytes).hexdigest()
+        expected_outcome_hash = hashlib.sha256(outcome_bytes).hexdigest()
+        if _decode_h5_text(attrs.get("source_motion_sha256", "")) != expected_motion_hash:
+            raise ValueError("RGB record source motion hash does not match motion.json")
+        if _decode_h5_text(attrs.get("source_outcome_sha256", "")) != expected_outcome_hash:
+            raise ValueError("RGB record source outcome hash does not match outcome.json")
+        for key in ("success", "task_success", "strict_geometry_pass"):
+            if not bool(attrs.get(key, False)) or outcome.get(key) is not True:
+                raise ValueError(f"RGB record requires source outcome {key}=true")
+
+        try:
+            camera_names = json.loads(_decode_h5_text(attrs["camera_names"]))
+        except (KeyError, json.JSONDecodeError) as exc:
+            raise ValueError("RGB record has invalid camera_names metadata") from exc
+        if not isinstance(camera_names, list) or not camera_names or any(
+            not isinstance(name, str) or not name for name in camera_names
+        ):
+            raise ValueError("RGB record camera names must be unique nonempty strings")
+        if len(set(camera_names)) != len(camera_names):
+            raise ValueError("RGB record camera names must be unique nonempty strings")
+        if not {"third_person", "wrist"} <= set(camera_names):
+            raise ValueError("RGB record must include third_person and wrist cameras")
+        if _decode_h5_text(attrs.get("coordinate_convention", "")) != (
+            "camera_to_initial_robot_base, meters, USD camera axes"
+        ):
+            raise ValueError("RGB record camera extrinsic convention is unsupported")
+        if _decode_h5_text(attrs.get("timestamp_convention", "")) != (
+            "measured Isaac Sim camera rendering_time_s; source motion time is stored separately"
+        ):
+            raise ValueError("RGB record timestamp convention is unsupported")
+
+        frames = motion.get("frames", [])
+        timestamps = np.asarray(h5_file["timestamps"], dtype=np.float64)
+        source_timestamps = np.asarray(h5_file["source_timestamps"], dtype=np.float64)
+        camera_timestamps = np.asarray(h5_file["camera_timestamps"], dtype=np.float64)
+        source_indices = np.asarray(h5_file["source_frame_indices"], dtype=np.int64)
+        camera_valid = np.asarray(h5_file["camera_valid"], dtype=bool)
+        intrinsics = np.asarray(h5_file["camera_intrinsics"], dtype=np.float64)
+        extrinsics = np.asarray(h5_file["camera_extrinsics"], dtype=np.float64)
+        render_numbers = np.asarray(h5_file["render_sequence_numbers"], dtype=np.int64)
+        render_frame_references = np.asarray(h5_file["render_frame_references"], dtype=np.int64)
+        distortion = np.asarray(h5_file["camera_distortion"], dtype=np.float64)
+        recorded_agent_pose = np.asarray(h5_file["agent_pose"], dtype=np.float64)
+        recorded_actions = np.asarray(h5_file["actions"], dtype=np.float64)
+        camera_count, capture_count = len(camera_names), len(timestamps)
+        if (
+            capture_count < 1
+            or timestamps.ndim != 1
+            or np.any(~np.isfinite(timestamps))
+            or np.any(np.diff(timestamps) <= 0)
+        ):
+            raise ValueError("RGB capture timestamps must be finite and strictly increasing")
+        if source_timestamps.shape != (capture_count,) or not np.isfinite(source_timestamps).all() or np.any(
+            np.diff(source_timestamps) <= 0
+        ):
+            raise ValueError("source motion timestamps must be finite and strictly increasing")
+        if camera_timestamps.shape != (camera_count, capture_count):
+            raise ValueError("camera timestamp axes do not match the RGB capture")
+        if not np.allclose(camera_timestamps, timestamps[None, :], rtol=0, atol=1e-6):
+            raise ValueError("camera timestamps are not aligned to source simulation time")
+        if source_indices.shape != (capture_count,) or np.any(np.diff(source_indices) <= 0):
+            raise ValueError("source frame indices must be unique and strictly increasing")
+        if np.any(source_indices < 0) or np.any(source_indices >= len(frames)):
+            raise ValueError("source frame index is outside motion.json")
+        source_times = np.asarray([frames[int(index)]["time"] for index in source_indices], dtype=np.float64)
+        if not np.allclose(source_timestamps, source_times, rtol=0, atol=1e-9):
+            raise ValueError("RGB source timestamps do not match their indexed source motion frames")
+        expected_agent_pose = np.asarray(
+            [frames[int(index)]["joint_positions"] for index in source_indices], dtype=np.float64
+        )
+        expected_actions = np.asarray(
+            [frames[int(index)]["applied_targets"] for index in source_indices], dtype=np.float64
+        )
+        if recorded_agent_pose.shape != expected_agent_pose.shape or not np.allclose(
+            recorded_agent_pose, expected_agent_pose, rtol=0, atol=1e-6
+        ):
+            raise ValueError("HDF5 joint states do not match their indexed source motion frames")
+        if recorded_actions.shape != expected_actions.shape or not np.allclose(
+            recorded_actions, expected_actions, rtol=0, atol=1e-6
+        ):
+            raise ValueError("HDF5 actions do not match their indexed source motion frames")
+        if camera_valid.shape != (camera_count, capture_count) or not camera_valid.all():
+            raise ValueError("every RGB camera frame must be marked valid")
+        if render_numbers.shape != (camera_count, capture_count) or np.any(
+            np.diff(render_numbers, axis=1) <= 0
+        ) or not np.all(render_numbers == render_numbers[0:1, :]):
+            raise ValueError("render sequence axes do not match the RGB capture")
+        if render_frame_references.shape != (camera_count, capture_count, 2):
+            raise ValueError("Isaac Sim render frame references do not match the RGB capture")
+        if np.any(render_frame_references[..., 0] < 0) or np.any(
+            render_frame_references[..., 1] <= 0
+        ) or not np.all(render_frame_references == render_frame_references[0:1, :, :]):
+            raise ValueError("RGB cameras do not share valid Isaac Sim render frame references")
+        if intrinsics.shape != (camera_count, 3, 3) or extrinsics.shape != (
+            camera_count,
+            capture_count,
+            4,
+            4,
+        ):
+            raise ValueError("camera calibration axes do not match camera/frame counts")
+        if distortion.shape != (camera_count, 5) or not np.isfinite(distortion).all():
+            raise ValueError("camera distortion coefficients must have shape [camera,5]")
+        if not np.allclose(distortion, 0.0, rtol=0, atol=1e-12):
+            raise ValueError("PFN calibration currently supports undistorted pinhole cameras only")
+        if not np.isfinite(intrinsics).all() or not np.isfinite(extrinsics).all():
+            raise ValueError("camera calibration contains non-finite values")
+        if np.any(intrinsics[:, 0, 0] <= 0) or np.any(intrinsics[:, 1, 1] <= 0):
+            raise ValueError("camera focal lengths must be positive")
+        if not np.allclose(intrinsics[:, 2, :], [0.0, 0.0, 1.0], rtol=0, atol=1e-6):
+            raise ValueError("camera intrinsics must use the pinhole K convention")
+        if not np.allclose(extrinsics[..., 3, :], [0.0, 0.0, 0.0, 1.0], rtol=0, atol=1e-6):
+            raise ValueError("camera extrinsics must be homogeneous camera-to-base transforms")
+        rotations = extrinsics[..., :3, :3]
+        identity = np.broadcast_to(np.eye(3), rotations.shape)
+        if not np.allclose(rotations @ np.swapaxes(rotations, -1, -2), identity, rtol=0, atol=1e-3):
+            raise ValueError("camera extrinsic rotations are not orthonormal")
+
+        rgb = {}
+        for name in camera_names:
+            dataset_name = f"{name}_rgb"
+            if dataset_name not in h5_file:
+                raise ValueError(f"RGB record is missing dataset {dataset_name}")
+            images = h5_file[dataset_name]
+            if images.ndim != 4 or images.shape[0] != capture_count or images.shape[-1] != 3:
+                raise ValueError(f"invalid RGB frame shape for {name}: {images.shape}")
+            if images.dtype != np.dtype(np.uint8):
+                raise ValueError(f"RGB dataset {dataset_name} must use uint8 pixels")
+            selected_images = np.asarray(images)
+            if not selected_images.any() or np.any(
+                selected_images.reshape(capture_count, -1).std(axis=1) < 1.0
+            ):
+                raise ValueError(f"RGB dataset {dataset_name} contains a blank frame")
+            rgb[name] = selected_images
+
+    return {
+        "path": path,
+        "sha256": _sha256_file(path),
+        "camera_names": camera_names,
+        "timestamps": timestamps,
+        "source_timestamps": source_timestamps,
+        "camera_timestamps": camera_timestamps,
+        "source_frame_indices": source_indices,
+        "camera_valid": camera_valid,
+        "intrinsics": intrinsics,
+        "extrinsics": extrinsics,
+        "render_sequence_numbers": render_numbers,
+        "render_frame_references": render_frame_references,
+        "images": rgb,
+    }
+
+
 def _source_archives(motion_path: Path, motion_bytes: bytes, outcome_path: Path | None, outcome_bytes: bytes | None, field_manifest: dict[str, Any]) -> dict[str, np.ndarray]:
     archives: dict[str, np.ndarray] = {
         "motion_json": np.frombuffer(motion_bytes, dtype=np.uint8).copy(),
@@ -391,8 +614,9 @@ def import_labutopia_episode(
     episode_id: str | None = None,
     split: str = "train",
     policy: str = "deployable",
+    calibrated_rgb_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Convert a LabUtopia motion/outcome pair into a hashed recorder-enabled dataset."""
+    """Convert LabUtopia JSON and an optional official RGB recorder episode."""
     motion_path = Path(motion_path).resolve()
     if motion_path.name not in {"motion.json", "partial-motion.json"}:
         raise ValueError("motion_path must point to motion.json or partial-motion.json")
@@ -411,7 +635,18 @@ def import_labutopia_episode(
         model=replace(config.model, recorder_enabled=True, recorder_policy=policy),
     )
     effective_config.validate()
-    recorder, frame_indices, body_paths = _frame_recorder(motion, effective_config, policy)
+    calibrated_rgb = None
+    available_indices = None
+    if calibrated_rgb_path is not None:
+        calibrated_rgb = _load_calibrated_rgb(
+            calibrated_rgb_path, motion_bytes, outcome_bytes, motion, outcome
+        )
+        if len(calibrated_rgb["camera_names"]) > effective_config.model.max_cameras:
+            raise ValueError("calibrated RGB camera count exceeds model.max_cameras")
+        available_indices = calibrated_rgb["source_frame_indices"]
+    recorder, frame_indices, body_paths = _frame_recorder(
+        motion, effective_config, policy, available_indices
+    )
     base_index, hand_index, tube_index = _body_indices(
         body_paths, effective_config.model.recorder_body_count
     )
@@ -422,22 +657,81 @@ def import_labutopia_episode(
     cfg = effective_config.model
     if cfg.max_cameras < 1:
         raise ValueError("at least one configured camera slot is required")
-    camera_count, size = 1, cfg.image_size
-    images = np.zeros((count, camera_count, 3, size, size), dtype=np.uint8)
+    if calibrated_rgb is None:
+        camera_count, size = 1, cfg.image_size
+        images = np.zeros((count, camera_count, 3, size, size), dtype=np.uint8)
+        pixel_valid = np.zeros((count, camera_count, size, size), dtype=bool)
+        camera_valid = np.zeros((count, camera_count), dtype=bool)
+        calibration = np.zeros((count, camera_count, 25), dtype=np.float32)
+        rgb_record_manifest = None
+    else:
+        camera_names = calibrated_rgb["camera_names"]
+        camera_count = len(camera_names)
+        size = cfg.image_size
+        capture_rows = {
+            int(source_index): row
+            for row, source_index in enumerate(calibrated_rgb["source_frame_indices"])
+        }
+        image_rows = [capture_rows[int(source_index)] for source_index in frame_indices]
+        times = np.asarray(calibrated_rgb["timestamps"][image_rows], dtype=np.float32)
+        recorder["sample_time"] = times.copy()
+        images = np.stack(
+            [
+                _resize_rgb_frames(
+                    np.asarray(calibrated_rgb["images"][name][image_rows], dtype=np.uint8),
+                    size,
+                ).transpose(0, 3, 1, 2)
+                for name in camera_names
+            ],
+            axis=1,
+        )
+        if images.shape != (count, camera_count, 3, size, size):
+            raise ValueError(f"calibrated RGB resize produced an invalid shape: {images.shape}")
+        pixel_valid = np.ones((count, camera_count, size, size), dtype=bool)
+        camera_valid = np.ones((count, camera_count), dtype=bool)
+        intrinsic_flat = np.broadcast_to(
+            calibrated_rgb["intrinsics"][None, :, :, :],
+            (count, camera_count, 3, 3),
+        ).reshape(count, camera_count, 9)
+        extrinsic_flat = calibrated_rgb["extrinsics"][:, image_rows].transpose(1, 0, 2, 3).reshape(
+            count, camera_count, 16
+        )
+        calibration = np.concatenate([intrinsic_flat, extrinsic_flat], axis=-1).astype(np.float32)
+        rgb_record_manifest = {
+            "schema": "labutopia-calibrated-rgb-v2",
+            "basename": Path(calibrated_rgb["path"]).name,
+            "sha256": calibrated_rgb["sha256"],
+            "camera_names": camera_names,
+            "capture_frame_count": int(len(calibrated_rgb["timestamps"])),
+            "selected_source_frame_indices": [int(index) for index in frame_indices],
+            "selected_source_timestamps_s": calibrated_rgb["source_timestamps"][image_rows].tolist(),
+            "camera_timestamp_max_abs_error_s": float(
+                np.max(np.abs(calibrated_rgb["camera_timestamps"] - calibrated_rgb["timestamps"][None, :]))
+            ),
+            "camera_to_source_timestamp_max_abs_error_s": float(
+                np.max(np.abs(calibrated_rgb["timestamps"] - calibrated_rgb["source_timestamps"]))
+            ),
+        }
+    if policy == "recorder_oracle" and "trace_valid" in recorder:
+        # The official camera clock is measured independently from the source
+        # motion clock. Keep only privileged trace samples that are causal with
+        # respect to the latest measured evidence timestamp.
+        trace_times = np.asarray(recorder["trace_times"], dtype=np.float64)
+        recorder["trace_valid"] &= trace_times <= float(times[-1]) + 1e-6
     joint_positions = recorder["joint_positions"]
     joint_velocities = recorder["joint_velocities"]
     applied_targets = recorder["applied_targets"]
     sensor = {
         "images": images,
-        "pixel_valid": np.zeros((count, camera_count, size, size), dtype=bool),
+        "pixel_valid": pixel_valid,
         "frame_valid": np.ones((count,), dtype=bool),
-        "camera_valid": np.zeros((count, camera_count), dtype=bool),
+        "camera_valid": camera_valid,
         "timestamps": times,
         "arrival_times": times.copy(),
         "query_time": np.asarray(times[-1], dtype=np.float32),
         "actions": np.zeros((count, cfg.action_dim), dtype=np.float32),
         "robots": np.zeros((count, cfg.robot_dim), dtype=np.float32),
-        "calibration": np.zeros((count, camera_count, 25), dtype=np.float32),
+        "calibration": calibration,
         "task": np.zeros((cfg.task_dim,), dtype=np.float32),
         "observed_results": np.zeros((count, cfg.outcome_dim), dtype=np.float32),
         "result_valid": np.zeros((count, cfg.outcome_dim), dtype=bool),
@@ -500,6 +794,7 @@ def import_labutopia_episode(
         "model_frames": count,
         "raw_trace_samples": len(motion.get("actual_pose_samples_480hz", [])),
         "model_trace_samples": len(recorder.get("trace_times", [])),
+        "calibrated_rgb": rgb_record_manifest,
         "all_source_fields": _source_field_manifest(
             motion, outcome, policy, outcome_bytes is not None
         ),
@@ -512,7 +807,17 @@ def import_labutopia_episode(
             "raw_source_preserved": True,
         },
     }
-    archives = _source_archives(motion_path, motion_bytes, outcome_path if outcome_bytes is not None else None, outcome_bytes, field_manifest)
+    archives = _source_archives(
+        motion_path,
+        motion_bytes,
+        outcome_path if outcome_bytes is not None else None,
+        outcome_bytes,
+        field_manifest,
+    )
+    if rgb_record_manifest is not None:
+        archives["rgb_record_manifest_json"] = np.asarray(
+            json.dumps(rgb_record_manifest, sort_keys=True, ensure_ascii=False)
+        )
     validate_episode_arrays(sensor, targets, effective_config, recorder=recorder)
     validate_recorder_arrays(recorder, effective_config)
 
@@ -573,4 +878,9 @@ def import_labutopia_episode(
         "recorder_fields": [f"recorder__{name}" for name in RECORDER_FIELDS if name in recorder],
         "archive_fields": [f"archive__{name}" for name in archives],
         "manifest_episodes": len(validated["episodes"]),
+        "camera_names": calibrated_rgb["camera_names"] if calibrated_rgb is not None else [],
+        "rgb_capture_frame_count": (
+            int(len(calibrated_rgb["timestamps"])) if calibrated_rgb is not None else 0
+        ),
+        "rgb_hdf5_sha256": calibrated_rgb["sha256"] if calibrated_rgb is not None else None,
     }

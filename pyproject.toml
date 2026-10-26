@@ -7,7 +7,7 @@ name = "rch-pfn"
 version = "0.1.0"
 description = "Relation-conditioned history inference from visual interaction contexts"
 requires-python = ">=3.11"
-dependencies = ["torch>=2.7,<3", "numpy>=1.26,<3", "scipy>=1.11,<2", "Pillow>=10,<13", "PyYAML>=6,<7", "filelock>=3.13"]
+dependencies = ["torch>=2.7,<3", "numpy>=1.26,<3", "scipy>=1.11,<2", "Pillow>=10,<13", "PyYAML>=6,<7", "filelock>=3.13", "h5py>=3.10,<4"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "ruff>=0.11", "build>=1.2"]
