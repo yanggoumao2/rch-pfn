@@ -5,6 +5,9 @@ project's data-producing pipeline.  Isaac Sim and the LabUtopia runtime still
 run on the HP workstation; the repository only owns the entry point and the
 capture contract.  The source motion and prepared USD stage remain explicit
 inputs so a capture can be reproduced and audited later.
+The default capture mode accepts only a verified success.  An explicit
+``--capture-mode failure-safe`` preserves a completed non-success outcome for
+research while keeping all camera, timestamp, and RGB gates unchanged.
 """
 
 from __future__ import annotations
@@ -146,10 +149,38 @@ def _render_frame_number(frame: dict) -> int:
     return int(numerator)
 
 
+def validate_source_outcome(outcome: dict, capture_mode: str) -> dict:
+    """Validate outcome provenance without dropping failed episodes.
+
+    The default success mode remains strict so an accidental invocation cannot
+    turn a failed replay into a training record.  Failure-safe mode only
+    relaxes the success predicate; it still requires independently produced,
+    explicit boolean outcome fields and returns the original mapping for
+    collector provenance.
+    """
+    if capture_mode not in {"success", "failure-safe"}:
+        raise ValueError(f"unsupported capture mode: {capture_mode!r}")
+    required = ("success", "task_success", "strict_geometry_pass")
+    if not isinstance(outcome, dict):
+        raise ValueError("source outcome must be a JSON object")
+    for key in required:
+        if type(outcome.get(key)) is not bool:
+            raise ValueError(f"source outcome field {key!r} must be boolean")
+    if capture_mode == "success" and not all(outcome[key] for key in required):
+        raise ValueError("source episode is not a verified strict-geometry success")
+    return outcome
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--motion", type=Path, required=True)
     parser.add_argument("--outcome", type=Path)
+    parser.add_argument(
+        "--capture-mode",
+        choices=("success", "failure-safe"),
+        default="success",
+        help="success requires all outcome gates; failure-safe preserves non-success outcomes",
+    )
     parser.add_argument("--stage", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -197,8 +228,7 @@ def main() -> None:
     body_paths = motion.get("body_paths")
     if not isinstance(frames, list) or not frames or not isinstance(body_paths, list):
         raise ValueError("motion JSON must contain body_paths and nonempty frames")
-    if not all(outcome.get(key) is True for key in ("success", "task_success", "strict_geometry_pass")):
-        raise ValueError("source episode is not a verified strict-geometry success")
+    validate_source_outcome(outcome, args.capture_mode)
     selected = _selected_frames(frames, args.sample_every)
     source_times = np.asarray([frames[index]["time"] for index in selected], dtype=np.float64)
     if not np.isfinite(source_times).all() or np.any(np.diff(source_times) <= 0):
@@ -396,8 +426,9 @@ def main() -> None:
         collector.set_outcome(outcome, motion_sha256, outcome_sha256)
         collector.set_task_properties(
             {
-                "task": "successful_test_tube_insertion",
+                "task": "test_tube_insertion",
                 "capture_mode": "isaacsim_pose_replay",
+                "outcome_policy": args.capture_mode,
                 "sample_every_source_frames": args.sample_every,
                 "source_motion_sha256": motion_sha256,
                 "source_outcome_sha256": outcome_sha256,
@@ -610,6 +641,7 @@ def main() -> None:
         report = {
             "schema": "labutopia-pose-replay-capture-v1",
             "capture_mode": "isaacsim_pose_replay",
+            "outcome_policy": args.capture_mode,
             "official_collector": "calibrated_rgb",
             "source_motion_sha256": motion_sha256,
             "source_outcome_sha256": outcome_sha256,
