@@ -401,6 +401,28 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def validate_calibrated_rgb_outcome_metadata(
+    outcome: dict[str, Any],
+    recorded_outcome: dict[str, Any],
+    outcome_policy: str,
+) -> dict[str, Any]:
+    """Validate HDF5 outcome metadata without discarding failure-safe records."""
+    if outcome_policy not in {"success", "failure-safe"}:
+        raise ValueError(f"unsupported calibrated RGB outcome policy: {outcome_policy!r}")
+    required = ("success", "task_success", "strict_geometry_pass")
+    for key in required:
+        if type(outcome.get(key)) is not bool:
+            raise ValueError(f"source outcome field {key!r} must be boolean")
+        recorded = recorded_outcome.get(key)
+        if not isinstance(recorded, (bool, np.bool_)):
+            raise ValueError(f"RGB record outcome field {key!r} must be boolean")
+        if bool(recorded) != outcome[key]:
+            raise ValueError(f"RGB record outcome {key} does not match source outcome")
+    if outcome_policy == "success" and not all(outcome[key] for key in required):
+        raise ValueError("RGB record requires source outcome success=true")
+    return outcome
+
+
 def _load_calibrated_rgb(
     path: str | Path,
     motion_bytes: bytes,
@@ -425,9 +447,20 @@ def _load_calibrated_rgb(
             raise ValueError("RGB record source motion hash does not match motion.json")
         if _decode_h5_text(attrs.get("source_outcome_sha256", "")) != expected_outcome_hash:
             raise ValueError("RGB record source outcome hash does not match outcome.json")
-        for key in ("success", "task_success", "strict_geometry_pass"):
-            if not bool(attrs.get(key, False)) or outcome.get(key) is not True:
-                raise ValueError(f"RGB record requires source outcome {key}=true")
+        task_properties: dict[str, Any] = {}
+        if "task_properties" in h5_file:
+            try:
+                raw_task_properties = h5_file["task_properties"][()]
+                task_properties = json.loads(_decode_h5_text(raw_task_properties))
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("RGB record has invalid task_properties metadata") from exc
+            if not isinstance(task_properties, dict):
+                raise ValueError("RGB record task_properties must be a JSON object")
+        validate_calibrated_rgb_outcome_metadata(
+            outcome,
+            {key: attrs.get(key) for key in ("success", "task_success", "strict_geometry_pass")},
+            str(task_properties.get("outcome_policy", "success")),
+        )
 
         try:
             camera_names = json.loads(_decode_h5_text(attrs["camera_names"]))
